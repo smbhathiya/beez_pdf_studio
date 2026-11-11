@@ -3,6 +3,7 @@
 
 mod theme;
 mod tools;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -14,6 +15,7 @@ use eframe::egui::{
 
 use theme::*;
 use tools::*;
+use update::UpdateUi;
 
 struct Running {
     label: String,
@@ -36,6 +38,7 @@ pub struct App {
     text: TextState,
     protect: ProtectState,
     unlock: UnlockState,
+    update: UpdateUi,
 }
 
 impl App {
@@ -56,6 +59,7 @@ impl App {
             text: Default::default(),
             protect: Default::default(),
             unlock: Default::default(),
+            update: UpdateUi::new(&cc.egui_ctx),
         };
         // Files passed on the command line (e.g. "Open with…").
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -214,7 +218,9 @@ impl App {
                 }
             });
         }
-        ui.add_space(24.0);
+        ui.add_space(32.0);
+        self.update.footer(ui);
+        ui.add_space(16.0);
     }
 
     // ---------------------------------------------------------------------------------
@@ -263,7 +269,8 @@ impl App {
             Tool::Protect => app.protect.ui(ui),
             Tool::Unlock => app.unlock.ui(ui),
         };
-        let busy = self.running.is_some();
+        // Tools are disabled while a task runs or while an update is being installed.
+        let busy = self.running.is_some() || self.update.busy();
         ui.add_enabled_ui(!busy, |ui| {
             if tool == Tool::Organize {
                 // The organizer fills the window and scrolls its own page grid.
@@ -342,9 +349,10 @@ impl App {
                                 out.parent().map(Path::to_path_buf)
                             };
                             if let Some(dir) = dir
-                                && ui.button(labeled(I_FOLDER, "Show in folder")).clicked() {
-                                    let _ = open_path(&dir);
-                                }
+                                && ui.button(labeled(I_FOLDER, "Show in folder")).clicked()
+                            {
+                                let _ = open_path(&dir);
+                            }
                         }
                     });
                 });
@@ -439,6 +447,7 @@ fn open_path(p: &Path) -> std::io::Result<()> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.update.poll();
         let ctx = ui.ctx().clone();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -479,14 +488,17 @@ impl eframe::App for App {
                 top: 28,
                 bottom: 16,
             }))
-            .show(ui, |ui| match self.tool {
-                None => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("home")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.home(ui));
+            .show(ui, |ui| {
+                self.update.banner(ui);
+                match self.tool {
+                    None => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("home")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.home(ui));
+                    }
+                    Some(tool) => action = self.tool_page(ui, tool),
                 }
-                Some(tool) => action = self.tool_page(ui, tool),
             });
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {

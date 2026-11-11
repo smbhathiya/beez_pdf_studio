@@ -334,7 +334,11 @@ fn pack_indices(idx: &[u8], w: usize, bpc: u32) -> Vec<u8> {
 /// Encode decoded pixels (`rgb` is 3 bytes/pixel) for the PDF.
 fn encode_pixels(rgb: &[u8], w: u32, h: u32, quality: Quality) -> Result<(Dictionary, Vec<u8>)> {
     let dict = image_dict(w, h);
-    let gray = rgb.as_chunks::<3>().0.iter().all(|p| p[0] == p[1] && p[1] == p[2]);
+    let gray = rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|p| p[0] == p[1] && p[1] == p[2]);
     let samples: Vec<u8> = if gray {
         rgb.as_chunks::<3>().0.iter().map(|p| p[0]).collect()
     } else {

@@ -5,6 +5,7 @@ use eframe::egui;
 
 mod pdf;
 mod ui;
+mod updater;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

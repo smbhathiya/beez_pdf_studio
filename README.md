@@ -136,66 +136,82 @@ opt-level = 3
 
 ## 5. Create a release
 
+Releases are built and published automatically by GitHub Actions
+([.github/workflows/release.yml](.github/workflows/release.yml)) when you push a version tag.
+
 ### Step 1: Bump the version
 
-Edit `version` in `Cargo.toml` (e.g. `0.1.0` → `0.2.0`), then run:
+Edit `version` in `Cargo.toml` (e.g. `0.1.0` → `0.2.0`), then check that everything passes:
 
 ```sh
 cargo test
 cargo build --release
 ```
 
-### Step 2: Package the executable
-
-**Windows (PowerShell):**
-
-```powershell
-$v = "0.2.0"
-New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item target\release\util_bee.exe "dist\UtilBee-PDF-Studio.exe"
-Copy-Item README.md dist\
-Compress-Archive -Path dist\* -DestinationPath "UtilBee-PDF-Studio-v$v-windows-x64.zip" -Force
-```
-
-**macOS / Linux:**
-
-```sh
-v=0.2.0
-mkdir -p dist && cp target/release/util_bee dist/utilbee-pdf-studio && cp README.md dist/
-tar -czf "UtilBee-PDF-Studio-v$v-$(uname -s | tr A-Z a-z)-$(uname -m).tar.gz" -C dist .
-```
-
-### Step 3: Tag the version in git
+### Step 2: Commit, tag and push
 
 ```sh
 git add -A
 git commit -m "release: v0.2.0"
 git tag v0.2.0
-git push origin main --tags
+git push origin master --tags
 ```
 
-### Step 4: Publish on GitHub (optional)
+The tag **must** be `v` + the version in `Cargo.toml`. The workflow stops if they don't match.
 
-This needs a GitHub remote (`git remote add origin <url>`) and the [GitHub CLI](https://cli.github.com) (`gh auth login`):
+### Step 3: Wait for the workflow
 
-```sh
-gh release create v0.2.0 UtilBee-PDF-Studio-v0.2.0-windows-x64.zip \
-  --title "UtilBee PDF Studio v0.2.0" \
-  --generate-notes
+On the repository's **Actions** tab, the *Release* workflow:
+
+1. runs the tests,
+2. builds `util_bee.exe` on Windows,
+3. zips it as `UtilBee-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
+4. creates the GitHub Release with auto-generated notes and the zip attached.
+
+When the workflow finishes, installed apps offer the update the next time they start (see [Auto-update](#6-auto-update)).
+
+### Manual release (without GitHub Actions)
+
+To publish by hand, the asset name and zip layout must match what the updater expects:
+
+```powershell
+$v = "0.2.0"
+Compress-Archive -Path target\release\util_bee.exe -DestinationPath "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" -Force
+gh release create "v$v" "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --title "UtilBee PDF Studio v$v" --generate-notes
 ```
 
-Users download the zip, extract it and double-click `UtilBee-PDF-Studio.exe`. No installation is needed.
+- The file name must contain `x86_64-pc-windows-msvc`.
+- `util_bee.exe` must be at the root of the zip. Don't rename it inside the zip.
 
 > **Windows SmartScreen:** unsigned executables show an "unknown publisher" warning the first time they run. Users can click **More info → Run anyway**. Code-signing the `.exe` removes the warning.
 
 ### Release checklist
 
 - [ ] Version bumped in `Cargo.toml`
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` is clean
+- [ ] `cargo test` passes and `cargo clippy` is clean
 - [ ] Release build tested by hand (open, merge, compress, save)
-- [ ] Archive created and named with the version
-- [ ] Git tag pushed and GitHub release published
+- [ ] Tag `vX.Y.Z` pushed
+- [ ] Release workflow succeeded and the zip is attached to the release
+
+---
+
+## 6. Auto-update
+
+The app updates itself from GitHub Releases ([src/updater.rs](src/updater.rs)):
+
+1. **On start-up** it checks the latest release in the background. If the user is offline or nothing is newer, nothing is shown.
+2. If a newer version exists, a bar appears: **"Version 0.2.0 is available"**, with **Update now**, **What's new** and dismiss buttons.
+3. **Update now** downloads the release zip, replaces the running `.exe` in place, and offers **Restart now**.
+4. Users can also click **Check for updates** at the bottom of the Home screen at any time.
+
+Requirements:
+
+- **The repository must be public.** GitHub's API returns *404 Not Found* for a private repository's releases unless a token is sent, and a token must never be shipped inside the app. To keep the source code private, publish releases to a separate public repository and change `REPO_NAME` in `src/updater.rs`.
+- The repository is set in `src/updater.rs` (`REPO_OWNER` / `REPO_NAME`).
+- Versions are compared as semantic versions (`0.10.0` is newer than `0.9.0`).
+- GitHub allows 60 unauthenticated API requests per hour per IP address. That is plenty for one check per app start.
+- Set the environment variable `UTILBEE_NO_UPDATE_CHECK=1` to turn off the start-up check (handy while developing).
+- The app must be in a folder the user can write to (Desktop, Downloads, `%LOCALAPPDATA%`…). Under `C:\Program Files` the replacement fails without admin rights, and the app then offers the download page instead.
 
 ---
 
@@ -205,11 +221,15 @@ Users download the zip, extract it and double-click `UtilBee-PDF-Studio.exe`. No
 util_bee/
 ├── Cargo.toml            dependencies & version
 ├── README.md
+├── .github/workflows/
+│   └── release.yml   builds & publishes a release when a vX.Y.Z tag is pushed
 └── src/
     ├── main.rs           window setup (title, size, drag & drop)
+    ├── updater.rs        self-update from GitHub Releases
     ├── ui/
     │   ├── mod.rs        app shell: Home launcher, tool pages, InfoBar, background tasks
     │   ├── theme.rs      Windows 11 look: fonts, Fluent icons, colors, cards, buttons
+    │   ├── update.rs     update banner (check, update now, restart)
     │   └── tools.rs      one panel per tool
     └── pdf/
         ├── mod.rs        shared helpers: page boxes, rotation-aware coordinates, ranges
@@ -229,6 +249,7 @@ util_bee/
 | [`image`](https://github.com/image-rs/image) | Decoding and encoding images |
 | [`rfd`](https://github.com/PolyMeilex/rfd) | Native open, save and folder dialogs |
 | [`rayon`](https://github.com/rayon-rs/rayon) | Parallel image compression |
+| [`self_update`](https://github.com/jaemk/self_update) | Checking GitHub Releases and replacing the executable |
 | [`flate2`](https://github.com/rust-lang/flate2-rs) | Maximum-level Deflate for images |
 | [`anyhow`](https://github.com/dtolnay/anyhow) | Error handling |
 
