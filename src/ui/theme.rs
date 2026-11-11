@@ -2,13 +2,12 @@
 //! surfaces, 4px control / 8px card corners, accent-coloured primary buttons.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText, Stroke, TextStyle,
-    Vec2,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
+    Stroke, TextStyle, Vec2,
 };
 use std::sync::Arc;
 
 // --- Segoe Fluent Icons code points (same values in Segoe MDL2 Assets on Windows 10) ---
-pub const I_HOME: &str = "\u{E80F}";
 pub const I_BACK: &str = "\u{E72B}";
 pub const I_ADD: &str = "\u{E710}";
 pub const I_CLOSE: &str = "\u{E711}";
@@ -18,6 +17,7 @@ pub const I_DOWN: &str = "\u{E74B}";
 pub const I_LEFT: &str = "\u{E76B}";
 pub const I_RIGHT: &str = "\u{E76C}";
 pub const I_ROTATE: &str = "\u{E7AD}";
+pub const I_ROTATE_LEFT: &str = "\u{E7A7}";
 pub const I_COPY: &str = "\u{E8C8}";
 pub const I_SELECT_ALL: &str = "\u{E8B3}";
 pub const I_SORT: &str = "\u{E8CB}";
@@ -48,11 +48,15 @@ pub fn semibold() -> FontFamily {
 /// Load Windows fonts when present; otherwise keep egui's built-in fonts.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let dir = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts\\")).unwrap_or_else(|_| "C:\\Windows\\Fonts\\".into());
+    let dir = std::env::var("WINDIR")
+        .map(|w| format!("{w}\\Fonts\\"))
+        .unwrap_or_else(|_| "C:\\Windows\\Fonts\\".into());
     let mut load = |name: &str, files: &[&str]| -> bool {
         for f in files {
             if let Ok(bytes) = std::fs::read(format!("{dir}{f}")) {
-                fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
+                fonts
+                    .font_data
+                    .insert(name.into(), Arc::new(FontData::from_owned(bytes)));
                 return true;
             }
         }
@@ -62,7 +66,11 @@ pub fn install_fonts(ctx: &egui::Context) {
     let sb = load("segoe-sb", &["seguisb.ttf", "segoeuib.ttf"]);
     let icons = load("fluent", &["SegoeIcons.ttf", "segmdl2.ttf"]);
 
-    let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let defaults = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
     let mut body = Vec::new();
     if ui {
         body.push("segoe".to_string());
@@ -148,41 +156,6 @@ pub fn install_theme(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Dark, visuals(true));
     ctx.set_visuals_of(egui::Theme::Light, visuals(false));
     ctx.all_styles_mut(|s| {
-    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
-    let r4 = CornerRadius::same(4);
-
-    v.panel_fill = p.bg;
-    v.window_fill = p.card;
-    v.window_stroke = Stroke::new(1.0, p.border);
-    v.window_corner_radius = CornerRadius::same(8);
-    v.faint_bg_color = if dark { Color32::from_rgb(0x27, 0x27, 0x27) } else { Color32::from_rgb(0xF7, 0xF7, 0xF7) };
-    v.extreme_bg_color = if dark { Color32::from_rgb(0x1F, 0x1F, 0x1F) } else { Color32::WHITE };
-    v.hyperlink_color = p.accent;
-    v.selection.bg_fill = p.accent.gamma_multiply(if dark { 0.45 } else { 0.25 });
-    v.selection.stroke = Stroke::new(1.0, p.accent);
-
-    let control = if dark { Color32::from_rgb(0x2D, 0x2D, 0x2D) } else { Color32::from_rgb(0xFB, 0xFB, 0xFB) };
-    let control_hover = if dark { Color32::from_rgb(0x33, 0x33, 0x33) } else { Color32::from_rgb(0xF5, 0xF5, 0xF5) };
-    let control_press = if dark { Color32::from_rgb(0x28, 0x28, 0x28) } else { Color32::from_rgb(0xF0, 0xF0, 0xF0) };
-    let stroke = if dark { Color32::from_rgb(0x3A, 0x3A, 0x3A) } else { Color32::from_rgb(0xD9, 0xD9, 0xD9) };
-
-    let w = &mut v.widgets;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, if dark { Color32::from_rgb(0x33, 0x33, 0x33) } else { p.border });
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
-    w.noninteractive.corner_radius = r4;
-    for (wv, bg) in [(&mut w.inactive, control), (&mut w.hovered, control_hover), (&mut w.active, control_press)] {
-        wv.bg_fill = bg;
-        wv.weak_bg_fill = bg;
-        wv.bg_stroke = Stroke::new(1.0, stroke);
-        wv.fg_stroke = Stroke::new(1.0, p.text);
-        wv.corner_radius = r4;
-        wv.expansion = 0.0;
-    }
-    w.open = w.active;
-    v
-}
-
-fn __spacing_marker() {
         s.spacing.item_spacing = Vec2::new(8.0, 8.0);
         s.spacing.button_padding = Vec2::new(12.0, 5.0);
         s.spacing.interact_size = Vec2::new(40.0, 30.0);
@@ -199,6 +172,83 @@ fn __spacing_marker() {
         ]
         .into();
     });
+}
+
+fn visuals(dark: bool) -> egui::Visuals {
+    let p = Palette::of(dark);
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    let r4 = CornerRadius::same(4);
+
+    v.panel_fill = p.bg;
+    v.window_fill = p.card;
+    v.window_stroke = Stroke::new(1.0, p.border);
+    v.window_corner_radius = CornerRadius::same(8);
+    v.faint_bg_color = if dark {
+        Color32::from_rgb(0x27, 0x27, 0x27)
+    } else {
+        Color32::from_rgb(0xF7, 0xF7, 0xF7)
+    };
+    v.extreme_bg_color = if dark {
+        Color32::from_rgb(0x1F, 0x1F, 0x1F)
+    } else {
+        Color32::WHITE
+    };
+    v.hyperlink_color = p.accent;
+    v.selection.bg_fill = p.accent.gamma_multiply(if dark { 0.45 } else { 0.25 });
+    v.selection.stroke = Stroke::new(1.0, p.accent);
+
+    let control = if dark {
+        Color32::from_rgb(0x2D, 0x2D, 0x2D)
+    } else {
+        Color32::from_rgb(0xFB, 0xFB, 0xFB)
+    };
+    let control_hover = if dark {
+        Color32::from_rgb(0x33, 0x33, 0x33)
+    } else {
+        Color32::from_rgb(0xF5, 0xF5, 0xF5)
+    };
+    let control_press = if dark {
+        Color32::from_rgb(0x28, 0x28, 0x28)
+    } else {
+        Color32::from_rgb(0xF0, 0xF0, 0xF0)
+    };
+    let stroke = if dark {
+        Color32::from_rgb(0x3A, 0x3A, 0x3A)
+    } else {
+        Color32::from_rgb(0xD9, 0xD9, 0xD9)
+    };
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_stroke = Stroke::new(
+        1.0,
+        if dark {
+            Color32::from_rgb(0x33, 0x33, 0x33)
+        } else {
+            p.border
+        },
+    );
+    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.corner_radius = r4;
+    for (wv, bg) in [
+        (&mut w.inactive, control),
+        (&mut w.hovered, control_hover),
+        (&mut w.active, control_press),
+    ] {
+        wv.bg_fill = bg;
+        wv.weak_bg_fill = bg;
+        wv.bg_stroke = Stroke::new(1.0, stroke);
+        wv.fg_stroke = Stroke::new(1.0, p.text);
+        wv.corner_radius = r4;
+        wv.expansion = 0.0;
+    }
+    w.open = w.active;
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
+    v
 }
 
 // ---------------------------------------------------------------------------------------
@@ -233,7 +283,11 @@ pub fn labeled(icon: &str, text: &str) -> String {
 /// Filled accent button (the "primary action").
 pub fn accent_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
     let p = Palette::current(ui);
-    let fill = if enabled { p.accent } else { p.accent.gamma_multiply(0.4) };
+    let fill = if enabled {
+        p.accent
+    } else {
+        p.accent.gamma_multiply(0.4)
+    };
     let btn = egui::Button::new(strong(text).color(p.on_accent))
         .fill(fill)
         .stroke(Stroke::NONE)
@@ -244,13 +298,21 @@ pub fn accent_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
 
 /// Flat command-bar button (no frame until hovered).
 pub fn command(ui: &mut egui::Ui, enabled: bool, icon: &str, text: &str) -> bool {
-    let btn = egui::Button::new(labeled(icon, text)).frame_when_inactive(false).min_size(Vec2::new(0.0, 32.0));
-    ui.add_enabled(enabled, btn).clicked()
+    let btn = egui::Button::new(format!("{icon}  {text}"))
+        .frame_when_inactive(false)
+        .min_size(Vec2::new(0.0, 32.0));
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.x = 8.0;
+        ui.add_enabled(enabled, btn).clicked()
+    })
+    .inner
 }
 
 /// Small square icon-only button with tooltip.
 pub fn icon_button(ui: &mut egui::Ui, enabled: bool, icon: &str, tip: &str) -> bool {
-    let btn = egui::Button::new(RichText::new(icon).size(13.0)).frame_when_inactive(false).min_size(Vec2::splat(30.0));
+    let btn = egui::Button::new(RichText::new(icon).size(13.0))
+        .frame_when_inactive(false)
+        .min_size(Vec2::splat(30.0));
     ui.add_enabled(enabled, btn).on_hover_text(tip).clicked()
 }
 
@@ -279,7 +341,13 @@ pub fn section(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Windows Settings style row: title + description on the left, control on the right.
-pub fn setting<R>(ui: &mut egui::Ui, icon: &str, name: &str, desc: &str, control: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub fn setting<R>(
+    ui: &mut egui::Ui,
+    icon: &str,
+    name: &str,
+    desc: &str,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     card(ui, |ui| {
         ui.horizontal(|ui| {
             if !icon.is_empty() {
@@ -293,7 +361,8 @@ pub fn setting<R>(ui: &mut egui::Ui, icon: &str, name: &str, desc: &str, control
                     caption(ui, desc);
                 }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control).inner
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control)
+                .inner
         })
         .inner
     })

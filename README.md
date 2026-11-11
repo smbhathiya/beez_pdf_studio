@@ -6,27 +6,44 @@ A fast desktop app for working with PDFs, written in Rust. Everything runs on yo
 
 ## Features
 
+The app opens on a **Home** screen with tool cards. Pick a tool and it opens full-window, with a back button (or press **Esc**) to return. The design follows Windows 11: Segoe UI fonts, Fluent icons, settings-style option cards, an InfoBar for results, and light or dark mode.
+
 | Group | Tool | What it does |
 |---|---|---|
-| Organize | **Page Organizer** | Load several PDFs as page tiles, then select, rotate, move, duplicate, delete or reverse pages and save |
+| Organize pages | **Page Organizer** | Load several PDFs as page tiles, then select, rotate, move, duplicate, delete or reverse pages and save |
 | | **Merge PDFs** | Join files in any order, optionally taking only some pages of each (`1-3, 7, 9-end`) |
-| | **Split / Extract** | Split into one file per page, every N pages or per range, or extract pages into one PDF |
-| Optimize & Convert | **Compress PDF** | Remove unused objects, use object streams and Flate, re-encode and downscale images |
-| | **Images to PDF** | Convert JPG, PNG, WEBP, GIF and BMP to PDF. Page sizes: A3, A4, A5, Letter, Legal or same as the image. JPEGs keep full quality |
+| | **Split & Extract** | Split into one file per page, every N pages or per range, or extract pages into one PDF |
+| Optimize & convert | **Compress PDF** | Light, Balanced or Strong presets: remove unused objects, use object streams, re-encode and downscale images |
+| | **Images to PDF** | Convert JPG, PNG, WEBP, GIF and BMP to PDF with lossless image optimization (see below) |
 | | **Extract Text** | Save a PDF's text as `.txt` |
-| Edit | **Watermark** | Text stamp with size, color, opacity, angle, position, and a choice of over or behind the content |
-| | **Page Numbers** | Formats such as `Page {n} of {total}`, with start number, skipping cover pages, and 7 positions |
-| | **Link Editor** | Add website links or go-to-page links, and list or remove existing links |
-| Document | **Properties & Metadata** | View document info and edit title, author, subject, keywords and more |
-| Security | **Protect** | AES-128 encryption with an open password, owner password and permissions |
-| | **Unlock** | Remove the password from a PDF you have the password for |
+| Edit document | **Link Editor** | Add website links or go-to-page links, and list or remove existing links |
+| | **Properties** | View document info and edit title, author, subject, keywords and more |
+| Security | **Protect PDF** | AES-128 encryption with an open password, owner password and permissions |
+| | **Unlock PDF** | Remove the password from a PDF you have the password for |
+
+### How Images to PDF keeps files small
+
+PDF files cannot contain WebP data, so the app applies the same lossless techniques WebP and PNG use, in forms PDF supports:
+
+- **Prediction filters:** row-by-row PNG filters (Sub, Up, Average, Paeth). Each image is compressed several ways and the smallest result is kept.
+- **Maximum Deflate** compression.
+- **Automatic palette:** images with 256 colors or fewer are stored as 1-, 2-, 4- or 8-bit indexed color.
+- **Grayscale detection:** color images that are really gray are stored with one channel.
+- **Transparency** is kept as a soft mask, and dropped when the image is fully opaque.
+- **JPEG photos** are embedded byte-for-byte, with no quality loss and no size increase.
+- **EXIF rotation** from phone photos is applied.
+
+There are also two optional settings:
+- **Smaller file (JPEG):** sets a JPEG quality. If lossless storage would be smaller for an image (common for screenshots), the app keeps that image lossless instead.
+- **Limit resolution:** downscales very large images before converting.
+
+Images are processed in parallel. Example: three screenshot PNGs totalling 246 KB were embedded in 211 KB, pixel for pixel identical.
 
 Other conveniences:
 
-- Drag files onto the window to add them to the current tool.
-- Open PDFs straight into the organizer: `util_bee.exe a.pdf b.pdf`
-- Work runs in the background, so the window never freezes. When a save finishes, the status bar offers **Open file** and **Open folder** buttons.
-- Dark and light themes.
+- Drag files onto the window. On Home, PDFs open in the Page Organizer and images open in Images to PDF.
+- Open files from the command line: `util_bee.exe a.pdf b.pdf`
+- Work runs in the background, so the window never freezes. When a task finishes, the InfoBar offers **Open file** and **Show in folder** buttons.
 
 ---
 
@@ -190,13 +207,15 @@ util_bee/
 ├── README.md
 └── src/
     ├── main.rs           window setup (title, size, drag & drop)
-    ├── app.rs            user interface (egui): sidebar, one panel per tool, background jobs
+    ├── ui/
+    │   ├── mod.rs        app shell: Home launcher, tool pages, InfoBar, background tasks
+    │   ├── theme.rs      Windows 11 look: fonts, Fluent icons, colors, cards, buttons
+    │   └── tools.rs      one panel per tool
     └── pdf/
-        ├── mod.rs        shared helpers: page boxes, rotation-aware coordinates, overlays, ranges
+        ├── mod.rs        shared helpers: page boxes, rotation-aware coordinates, ranges
         ├── assemble.rs   page-assembly engine behind merge, split, extract and organize
         ├── compress.rs   structural + image compression
-        ├── images.rs     images → PDF
-        ├── stamp.rs      watermarks & page numbers
+        ├── images.rs     images → PDF with lossless optimization
         ├── links.rs      link annotations
         └── meta.rs       metadata, text extraction, encryption
 ```
@@ -210,6 +229,7 @@ util_bee/
 | [`image`](https://github.com/image-rs/image) | Decoding and encoding images |
 | [`rfd`](https://github.com/PolyMeilex/rfd) | Native open, save and folder dialogs |
 | [`rayon`](https://github.com/rayon-rs/rayon) | Parallel image compression |
+| [`flate2`](https://github.com/rust-lang/flate2-rs) | Maximum-level Deflate for images |
 | [`anyhow`](https://github.com/dtolnay/anyhow) | Error handling |
 
 ---
@@ -218,4 +238,4 @@ util_bee/
 
 - Page tiles show page shapes and numbers, not rendered previews. Rendering previews would need a PDF rasterizer such as pdfium.
 - Merge, split and organize keep page content, annotations and links. They drop document-level features: bookmarks, form field definitions and attachments.
-- Watermarks and page numbers use the built-in Helvetica font, which only covers Latin-1 characters.
+- The Windows 11 fonts and icons are loaded from `C:\Windows\Fonts`. On other systems the app falls back to egui's built-in fonts, and the icons will not display.

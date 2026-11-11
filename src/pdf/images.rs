@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression as Level, write::ZlibEncoder};
-use image::{DynamicImage, ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder, metadata::Orientation as Exif};
+use image::{
+    DynamicImage, ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder,
+    metadata::Orientation as Exif,
+};
 use lopdf::{Dictionary, Document, Object, Stream, dictionary};
 use rayon::prelude::*;
 
@@ -179,18 +182,31 @@ fn jpeg_passthrough(data: Vec<u8>, w: u32, h: u32, comps: u8) -> Option<Encoded>
         _ => return None,
     }
     let source_size = data.len();
-    Some(Encoded { width: w, height: h, dict, data, smask: None, source_size })
+    Some(Encoded {
+        width: w,
+        height: h,
+        dict,
+        data,
+        smask: None,
+        source_size,
+    })
 }
 
 fn jpeg_encode(pixels: &[u8], w: u32, h: u32, gray: bool, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let color = if gray { image::ExtendedColorType::L8 } else { image::ExtendedColorType::Rgb8 };
-    JpegEncoder::new_with_quality(Cursor::new(&mut out), quality.clamp(10, 100)).encode(pixels, w, h, color)?;
+    let color = if gray {
+        image::ExtendedColorType::L8
+    } else {
+        image::ExtendedColorType::Rgb8
+    };
+    JpegEncoder::new_with_quality(Cursor::new(&mut out), quality.clamp(10, 100))
+        .encode(pixels, w, h, color)?;
     Ok(out)
 }
 
 /// PNG-style prediction: each row is prefixed by the filter that makes it most compressible.
-fn png_predict(raw: &[u8], row_bytes: usize, bpp: usize) -> Vec<u8> {
+/// `fixed` forces one filter type for every row; `None` picks the best filter per row.
+fn png_predict(raw: &[u8], row_bytes: usize, bpp: usize, fixed: Option<u8>) -> Vec<u8> {
     let rows = raw.len() / row_bytes;
     let mut out = Vec::with_capacity(raw.len() + rows);
     let zero = vec![0u8; row_bytes];
@@ -198,10 +214,18 @@ fn png_predict(raw: &[u8], row_bytes: usize, bpp: usize) -> Vec<u8> {
     let mut best = vec![0u8; row_bytes];
     for r in 0..rows {
         let row = &raw[r * row_bytes..(r + 1) * row_bytes];
-        let prev = if r == 0 { &zero[..] } else { &raw[(r - 1) * row_bytes..r * row_bytes] };
+        let prev = if r == 0 {
+            &zero[..]
+        } else {
+            &raw[(r - 1) * row_bytes..r * row_bytes]
+        };
         let mut best_filter = 0u8;
         let mut best_score = u64::MAX;
-        for filter in 0..5u8 {
+        let filters = match fixed {
+            Some(f) => f..=f,
+            None => 0..=4u8,
+        };
+        for filter in filters {
             for i in 0..row_bytes {
                 let a = if i >= bpp { row[i - bpp] } else { 0 };
                 let b = prev[i];
@@ -213,14 +237,27 @@ fn png_predict(raw: &[u8], row_bytes: usize, bpp: usize) -> Vec<u8> {
                     3 => ((a as u16 + b as u16) / 2) as u8,
                     _ => {
                         let p = a as i16 + b as i16 - c as i16;
-                        let (pa, pb, pc) = ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs());
-                        if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
+                        let (pa, pb, pc) = (
+                            (p - a as i16).abs(),
+                            (p - b as i16).abs(),
+                            (p - c as i16).abs(),
+                        );
+                        if pa <= pb && pa <= pc {
+                            a
+                        } else if pb <= pc {
+                            b
+                        } else {
+                            c
+                        }
                     }
                 };
                 candidate[i] = row[i].wrapping_sub(pred);
             }
             // Minimum sum of absolute differences: the standard PNG heuristic.
-            let score: u64 = candidate.iter().map(|&v| (v as i8).unsigned_abs() as u64).sum();
+            let score: u64 = candidate
+                .iter()
+                .map(|&v| (v as i8).unsigned_abs() as u64)
+                .sum();
             if score < best_score {
                 best_score = score;
                 best_filter = filter;
@@ -245,14 +282,33 @@ fn lossless_stream(dict: &mut Dictionary, raw: &[u8], w: u32, colors: u32, bpc: 
     let bpp = ((colors * bpc).div_ceil(8)).max(1) as usize;
     dict.set("BitsPerComponent", bpc as i64);
     dict.set("Filter", "FlateDecode");
-    dict.set(
-        "DecodeParms",
-        dictionary! {
-            "Predictor" => 15, "Colors" => colors as i64,
-            "BitsPerComponent" => bpc as i64, "Columns" => w as i64,
-        },
-    );
-    deflate(&png_predict(raw, row_bytes, bpp))
+
+    // Like PNG optimisers: try several strategies and keep the smallest result.
+    // None = plain Deflate, Some(None) = adaptive per-row filters, Some(Some(f)) = one filter for all rows.
+    let strategies: [Option<Option<u8>>; 4] = [None, Some(None), Some(Some(2)), Some(Some(4))];
+    let (best, data) = strategies
+        .par_iter()
+        .map(|s| {
+            let data = match s {
+                None => deflate(raw),
+                Some(f) => deflate(&png_predict(raw, row_bytes, bpp, *f)),
+            };
+            (*s, data)
+        })
+        .min_by_key(|(_, d)| d.len())
+        .expect("strategies is not empty");
+    if best.is_some() {
+        dict.set(
+            "DecodeParms",
+            dictionary! {
+                "Predictor" => 15, "Colors" => colors as i64,
+                "BitsPerComponent" => bpc as i64, "Columns" => w as i64,
+            },
+        );
+    } else {
+        dict.remove(b"DecodeParms");
+    }
+    data
 }
 
 /// Pack 8-bit palette indices into rows of 1/2/4-bit samples (MSB first).
@@ -277,23 +333,36 @@ fn pack_indices(idx: &[u8], w: usize, bpc: u32) -> Vec<u8> {
 
 /// Encode decoded pixels (`rgb` is 3 bytes/pixel) for the PDF.
 fn encode_pixels(rgb: &[u8], w: u32, h: u32, quality: Quality) -> Result<(Dictionary, Vec<u8>)> {
-    let mut dict = image_dict(w, h);
-    let gray = rgb.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]);
-    let samples: Vec<u8> = if gray { rgb.chunks_exact(3).map(|p| p[0]).collect() } else { rgb.to_vec() };
+    let dict = image_dict(w, h);
+    let gray = rgb.as_chunks::<3>().0.iter().all(|p| p[0] == p[1] && p[1] == p[2]);
+    let samples: Vec<u8> = if gray {
+        rgb.as_chunks::<3>().0.iter().map(|p| p[0]).collect()
+    } else {
+        rgb.to_vec()
+    };
     let color_space = if gray { "DeviceGray" } else { "DeviceRGB" };
 
     if let Quality::Lossy(q) = quality {
-        dict.set("ColorSpace", color_space);
-        dict.set("BitsPerComponent", 8);
-        dict.set("Filter", "DCTDecode");
-        return Ok((dict, jpeg_encode(&samples, w, h, gray, q)?));
+        let mut d = dict.clone();
+        d.set("ColorSpace", color_space);
+        d.set("BitsPerComponent", 8);
+        d.set("Filter", "DCTDecode");
+        let jpeg = jpeg_encode(&samples, w, h, gray, q)?;
+        // Screenshots and line art often compress better losslessly than as JPEG:
+        // use the lossless result when it is smaller.
+        let lossless = encode_pixels(rgb, w, h, Quality::Lossless)?;
+        return Ok(if lossless.1.len() <= jpeg.len() {
+            lossless
+        } else {
+            (d, jpeg)
+        });
     }
 
     // Palette: screenshots, logos, diagrams and scans usually have few colours.
     let mut palette: HashMap<[u8; 3], u8> = HashMap::new();
     let mut indices = Vec::with_capacity((w * h) as usize);
     let mut fits = true;
-    for p in rgb.chunks_exact(3) {
+    for p in rgb.as_chunks::<3>().0 {
         let key = [p[0], p[1], p[2]];
         let next = palette.len();
         let i = match palette.get(&key) {
@@ -343,7 +412,11 @@ fn encode_pixels(rgb: &[u8], w: u32, h: u32, quality: Quality) -> Result<(Dictio
     let packed = pack_indices(&indices, w as usize, bpc);
     let data = lossless_stream(&mut d, &packed, w, 1, bpc);
     // Keep whichever is smaller (gray photos can beat a 256-colour palette).
-    Ok(if data.len() < direct.1.len() { (d, data) } else { direct })
+    Ok(if data.len() < direct.1.len() {
+        (d, data)
+    } else {
+        direct
+    })
 }
 
 fn encode_file(path: &Path, opts: &ImageOptions) -> Result<Encoded> {
@@ -396,7 +469,14 @@ fn encode_file(path: &Path, opts: &ImageOptions) -> Result<Encoded> {
 
     let rgb = img.to_rgb8().into_raw();
     let (dict, encoded) = encode_pixels(&rgb, w, h, opts.quality)?;
-    let result = Encoded { width: w, height: h, dict, data: encoded, smask, source_size };
+    let result = Encoded {
+        width: w,
+        height: h,
+        dict,
+        data: encoded,
+        smask,
+        source_size,
+    };
 
     // A lossy re-encode that came out bigger than the original JPEG is pointless.
     match passthrough {
@@ -413,7 +493,10 @@ pub fn images_to_pdf(paths: &[PathBuf], opts: &ImageOptions, output: &Path) -> R
     if paths.is_empty() {
         bail!("Add at least one image");
     }
-    let encoded: Vec<Encoded> = paths.par_iter().map(|p| encode_file(p, opts)).collect::<Result<_>>()?;
+    let encoded: Vec<Encoded> = paths
+        .par_iter()
+        .map(|p| encode_file(p, opts))
+        .collect::<Result<_>>()?;
 
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
@@ -498,7 +581,8 @@ mod tests {
         let dir = test_dir("utilbee_img_test");
         let png = dir.join("a.png");
         let jpg = dir.join("b.jpg");
-        let img = image::RgbaImage::from_fn(40, 30, |x, _| image::Rgba([x as u8 * 6, 100, 50, 128]));
+        let img =
+            image::RgbaImage::from_fn(40, 30, |x, _| image::Rgba([x as u8 * 6, 100, 50, 128]));
         img.save(&png).unwrap();
         DynamicImage::ImageRgba8(img).to_rgb8().save(&jpg).unwrap();
         let out = dir.join("out.pdf");
@@ -507,7 +591,11 @@ mod tests {
         assert_eq!(doc.get_pages().len(), 2);
         assert_eq!(jpeg_info(&fs::read(&jpg).unwrap()), Some((40, 30, 3)));
 
-        let lossy = ImageOptions { quality: Quality::Lossy(60), max_dimension: 20, ..Default::default() };
+        let lossy = ImageOptions {
+            quality: Quality::Lossy(60),
+            max_dimension: 20,
+            ..Default::default()
+        };
         images_to_pdf(&[dir.join("a.png")], &lossy, &dir.join("lossy.pdf")).unwrap();
         assert!(Document::load(dir.join("lossy.pdf")).is_ok());
     }
@@ -523,14 +611,17 @@ mod tests {
             Object::Name(n) if n == b"DeviceRGB" => raw,
             Object::Name(n) if n == b"DeviceGray" => raw.iter().flat_map(|&g| [g, g, g]).collect(),
             Object::Array(a) => {
-                let Object::String(table, _) = &a[3] else { panic!() };
+                let Object::String(table, _) = &a[3] else {
+                    panic!()
+                };
                 let row_bytes = (w as usize * bpc).div_ceil(8);
                 let mut px = Vec::new();
                 for y in 0..h as usize {
                     for x in 0..w as usize {
                         let bit = x * bpc;
                         let byte = raw[y * row_bytes + bit / 8];
-                        let i = ((byte >> (8 - bpc - bit % 8)) & ((1u16 << bpc) - 1) as u8) as usize;
+                        let i =
+                            ((byte >> (8 - bpc - bit % 8)) & ((1u16 << bpc) - 1) as u8) as usize;
                         px.extend_from_slice(&table[i * 3..i * 3 + 3]);
                     }
                 }
@@ -546,13 +637,30 @@ mod tests {
     fn lossless_is_exact_and_small() {
         let (w, h) = (101u32, 37u32);
         // Two colours → 1-bit palette.
-        let bw: Vec<u8> = (0..w * h).flat_map(|i| if (i / 7) % 2 == 0 { [0, 0, 0] } else { [255, 255, 255] }).collect();
+        let bw: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                if (i / 7) % 2 == 0 {
+                    [0, 0, 0]
+                } else {
+                    [255, 255, 255]
+                }
+            })
+            .collect();
         // Few colours → 4-bit palette.
-        let few: Vec<u8> = (0..w * h).flat_map(|i| [(i % 9) as u8 * 20, 50, 200]).collect();
+        let few: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i % 9) as u8 * 20, 50, 200])
+            .collect();
         // Gray gradient.
-        let gray: Vec<u8> = (0..w * h).flat_map(|i| { let g = (i % w) as u8; [g, g, g] }).collect();
+        let gray: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let g = (i % w) as u8;
+                [g, g, g]
+            })
+            .collect();
         // Many colours → direct RGB.
-        let rich: Vec<u8> = (0..w * h).flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i * 7 % 256) as u8]).collect();
+        let rich: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i * 7 % 256) as u8])
+            .collect();
         for px in [&bw, &few, &gray, &rich] {
             let size = roundtrip(px, w, h);
             assert!(size < px.len(), "compressed {size} vs raw {}", px.len());
