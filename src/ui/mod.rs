@@ -549,6 +549,8 @@ impl eframe::App for App {
                 None => {
                     egui::ScrollArea::vertical()
                         .id_salt("home")
+                        // No visible scroll bar on Home; the mouse wheel still scrolls.
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, false])
                         .show(ui, |ui| self.home(ui));
                 }
