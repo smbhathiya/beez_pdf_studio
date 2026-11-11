@@ -290,7 +290,8 @@ impl App {
                     .id_salt(tool.name())
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(920.0);
+                        // Use the full window width (leave room for the scroll bar).
+                        ui.set_width(ui.available_width() - 12.0);
                         let r = body(self, ui);
                         ui.add_space(24.0);
                         r

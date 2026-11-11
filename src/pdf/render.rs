@@ -60,20 +60,23 @@ fn worker(path: &Path, rx: Receiver<Request>, results: Sender<Rendered>, wake: i
     let mut done: HashSet<Request> = HashSet::new();
     loop {
         // Block for work when idle, then grab everything else that is waiting.
+        let mut batch = Vec::new();
         if queue.is_empty() {
             match rx.recv() {
-                Ok(r) => queue.push(r),
+                Ok(r) => batch.push(r),
                 Err(_) => return, // the UI dropped this document
             }
         }
         loop {
             match rx.try_recv() {
-                Ok(r) => queue.push(r),
+                Ok(r) => batch.push(r),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
         }
-        // Newest request first.
+        // `queue` is a stack: the newest batch is served first, and within a batch the pages
+        // are served in the order they were requested (top of the screen first).
+        queue.extend(batch.into_iter().rev());
         let Some(req) = queue.pop() else { continue };
         if !done.insert(req) {
             continue;
@@ -137,15 +140,18 @@ pub fn spawn_image_worker(
             let mut queue: Vec<(PathBuf, Request)> = Vec::new();
             let mut done: HashSet<(PathBuf, Request)> = HashSet::new();
             loop {
+                let mut batch = Vec::new();
                 if queue.is_empty() {
                     match rx.recv() {
-                        Ok(r) => queue.push(r),
+                        Ok(r) => batch.push(r),
                         Err(_) => return,
                     }
                 }
                 while let Ok(r) = rx.try_recv() {
-                    queue.push(r);
+                    batch.push(r);
                 }
+                // Newest batch first, in request order within the batch.
+                queue.extend(batch.into_iter().rev());
                 let Some((path, req)) = queue.pop() else {
                     continue;
                 };
