@@ -183,7 +183,6 @@ impl App {
     // ---------------------------------------------------------------------------------
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        let p = Palette::current(ui);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(title("PDF Studio"));
@@ -196,39 +195,13 @@ impl App {
 
         // Drop zone
         ui.add_space(20.0);
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 96.0), Sense::click());
-        let hovered = resp.hovered();
-        ui.painter()
-            .rect_filled(rect, 8.0, if hovered { p.card_hover } else { p.card });
-        ui.painter().rect_stroke(
-            rect,
-            8.0,
-            Stroke::new(
-                1.0,
-                if hovered {
-                    p.accent
-                } else {
-                    p.text2.gamma_multiply(0.5)
-                },
-            ),
-            StrokeKind::Inside,
+        let clicked = drop_zone(
+            ui,
+            150.0,
+            "Drop files here or click to browse",
+            "PDFs open in the Page Organizer · images open in Images to PDF",
         );
-        ui.painter().text(
-            rect.center() - Vec2::new(0.0, 12.0),
-            Align2::CENTER_CENTER,
-            format!("{I_OPEN}   Open or drop files here"),
-            FontId::new(16.0, semibold()),
-            p.text,
-        );
-        ui.painter().text(
-            rect.center() + Vec2::new(0.0, 14.0),
-            Align2::CENTER_CENTER,
-            "PDFs open in the Page Organizer and images open in Images to PDF",
-            FontId::proportional(12.0),
-            p.text2,
-        );
-        if resp.clicked() {
+        if clicked {
             let files = rfd::FileDialog::new()
                 .add_filter("PDFs and images", &[PDF_EXT, IMG_EXT].concat())
                 .pick_files()

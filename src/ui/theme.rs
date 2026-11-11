@@ -42,6 +42,7 @@ pub const I_DOCUMENT: &str = "\u{E8A5}";
 pub const I_CLEAR: &str = "\u{E894}";
 pub const I_REMOVE: &str = "\u{E738}";
 pub const I_GRIP: &str = "\u{E700}";
+pub const I_UPLOAD: &str = "\u{E898}";
 
 pub fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())
@@ -368,4 +369,103 @@ pub fn setting<R>(
         })
         .inner
     })
+}
+
+/// "Drop files here or click to browse" area, like on the Home screen. It lights up while
+/// files are dragged over the window. Returns true when clicked (open a file dialog then).
+/// Dropped files are routed by the app shell to the current tool.
+pub fn drop_zone(ui: &mut egui::Ui, height: f32, title: &str, subtitle: &str) -> bool {
+    let p = Palette::current(ui);
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let dragging_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+    let active = resp.hovered() || dragging_files;
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        8.0,
+        if dragging_files {
+            p.accent.gamma_multiply(0.12)
+        } else if active {
+            p.card_hover
+        } else {
+            p.card
+        },
+    );
+    // Dashed outline.
+    let r = rect.shrink(1.0);
+    let outline = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+        r.left_top(),
+    ];
+    let color = if active {
+        p.accent
+    } else {
+        p.text2.gamma_multiply(0.55)
+    };
+    painter.extend(egui::Shape::dashed_line(
+        &outline,
+        Stroke::new(1.5, color),
+        8.0,
+        6.0,
+    ));
+
+    let compact = height < 100.0;
+    if compact {
+        // One line: icon, title and subtitle side by side.
+        let text = format!("{I_UPLOAD}   {title}");
+        let g1 = painter.layout_no_wrap(
+            text,
+            FontId::new(14.0, semibold()),
+            if active { p.accent } else { p.text },
+        );
+        let g2 = painter.layout_no_wrap(subtitle.to_string(), FontId::proportional(12.0), p.text2);
+        let total = g1.size().x + 14.0 + g2.size().x;
+        let x = rect.center().x - total / 2.0;
+        painter.galley(
+            egui::pos2(x, rect.center().y - g1.size().y / 2.0),
+            g1.clone(),
+            p.text,
+        );
+        painter.galley(
+            egui::pos2(x + g1.size().x + 14.0, rect.center().y - g2.size().y / 2.0),
+            g2,
+            p.text2,
+        );
+    } else {
+        let c = rect.center();
+        painter.circle_filled(
+            c - Vec2::new(0.0, 26.0),
+            24.0,
+            p.accent.gamma_multiply(if p.dark { 0.2 } else { 0.12 }),
+        );
+        painter.text(
+            c - Vec2::new(0.0, 26.0),
+            egui::Align2::CENTER_CENTER,
+            I_UPLOAD,
+            FontId::proportional(22.0),
+            p.accent,
+        );
+        painter.text(
+            c + Vec2::new(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            title,
+            FontId::new(16.0, semibold()),
+            p.text,
+        );
+        painter.text(
+            c + Vec2::new(0.0, 38.0),
+            egui::Align2::CENTER_CENTER,
+            subtitle,
+            FontId::proportional(12.0),
+            p.text2,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }

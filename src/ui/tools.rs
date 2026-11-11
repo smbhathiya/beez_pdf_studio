@@ -185,6 +185,25 @@ impl Source {
 
     /// Returns true when the file changed.
     fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> bool {
+        if self.path.is_none() {
+            let picked = drop_zone(
+                ui,
+                170.0,
+                "Drop a PDF here or click to browse",
+                "Choose the PDF file to work on",
+            )
+            .then(|| pick_file("PDF", PDF_EXT))
+            .flatten();
+            ui.add_space(4.0);
+            return match picked {
+                Some(p) => {
+                    thumbs.invalidate(&p);
+                    self.set(p);
+                    true
+                }
+                None => false,
+            };
+        }
         let (name, info) = match &self.path {
             Some(p) => {
                 let pages = if self.pages > 0 {
@@ -302,13 +321,15 @@ impl MergeState {
             }
         });
         section(ui, "Files, merged from top to bottom");
-        if self.items.is_empty() {
-            card(ui, |ui| {
-                ui.label(secondary(
-                    ui,
-                    "Add two or more PDFs, or drag them onto the window.",
-                ));
-            });
+        if self.items.is_empty()
+            && drop_zone(
+                ui,
+                170.0,
+                "Drop PDF files here or click to browse",
+                "Add two or more PDFs to combine them into one",
+            )
+        {
+            self.add(pick_files("PDF", PDF_EXT));
         }
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let clip = ui.clip_rect();
@@ -379,6 +400,19 @@ impl MergeState {
             if !removed {
                 i += 1;
             }
+        }
+
+        if !self.items.is_empty() {
+            ui.add_space(4.0);
+            if drop_zone(
+                ui,
+                56.0,
+                "Add more PDFs",
+                "Drop files here or click to browse",
+            ) {
+                self.add(pick_files("PDF", PDF_EXT));
+            }
+            ui.add_space(4.0);
         }
 
         // --- Drag files by their handle to reorder or remove them ---------------------
@@ -849,20 +883,15 @@ impl OrganizeState {
     fn grid(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) {
         let p = Palette::current(ui);
         if self.tiles.is_empty() {
-            ui.add_space(60.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(I_GRID).size(44.0).color(p.text2));
-                ui.add_space(8.0);
-                ui.label(subtitle("No pages yet"));
-                ui.label(secondary(
-                    ui,
-                    "Add one or more PDFs, or drag them here, to arrange their pages.",
-                ));
-                ui.add_space(12.0);
-                if accent_button(ui, true, &labeled(I_ADD, "Add PDFs")) {
-                    self.add(pick_files("PDF", PDF_EXT));
-                }
-            });
+            let h = (ui.available_height() - 8.0).clamp(170.0, 420.0);
+            if drop_zone(
+                ui,
+                h,
+                "Drop PDF files here or click to browse",
+                "Add one or more PDFs to arrange, rotate, duplicate or delete their pages",
+            ) {
+                self.add(pick_files("PDF", PDF_EXT));
+            }
             return;
         }
         let nsel = self.tiles.iter().filter(|t| t.selected).count();
@@ -1352,12 +1381,14 @@ impl ImagesState {
 
         if self.images.is_empty() {
             section(ui, "Images");
-            card(ui, |ui| {
-                ui.label(secondary(
-                    ui,
-                    "Add JPG, PNG, WEBP, GIF or BMP images, or drag them onto the window.",
-                ));
-            });
+            if drop_zone(
+                ui,
+                170.0,
+                "Drop images here or click to browse",
+                "JPG, PNG, WEBP, GIF or BMP · one image per page",
+            ) {
+                self.add(pick_files("Images", IMG_EXT));
+            }
         } else {
             let total: u64 = self
                 .images
@@ -1376,6 +1407,14 @@ impl ImagesState {
                 ),
                 |_| {},
             );
+            if drop_zone(
+                ui,
+                56.0,
+                "Add more images",
+                "Drop files here or click to browse",
+            ) {
+                self.add(pick_files("Images", IMG_EXT));
+            }
         }
 
         section(ui, "Image quality");
@@ -1616,18 +1655,19 @@ impl LinksState {
         ui.add_space(8.0);
         let height = (ui.available_height() - 4.0).max(320.0);
         let mut action = None;
+        let column = egui::Layout::top_down(egui::Align::Min);
         ui.horizontal_top(|ui| {
-            ui.allocate_ui(Vec2::new(132.0, height), |ui| {
+            ui.allocate_ui_with_layout(Vec2::new(132.0, height), column, |ui| {
                 self.page_list(ui, thumbs, &path, pages)
             });
             ui.add_space(6.0);
             let side_w = 330.0;
             let canvas_w = (ui.available_width() - side_w - 12.0).max(240.0);
-            ui.allocate_ui(Vec2::new(canvas_w, height), |ui| {
+            ui.allocate_ui_with_layout(Vec2::new(canvas_w, height), column, |ui| {
                 self.canvas(ui, thumbs, &path, pages)
             });
             ui.add_space(6.0);
-            ui.allocate_ui(Vec2::new(side_w, height), |ui| {
+            ui.allocate_ui_with_layout(Vec2::new(side_w, height), column, |ui| {
                 action = self.side_panel(ui, &path, pages)
             });
         });
@@ -2353,6 +2393,18 @@ pub struct UnlockState {
 impl UnlockState {
     pub fn ui(&mut self, ui: &mut egui::Ui, _thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
+        if self.path.is_none() {
+            if drop_zone(
+                ui,
+                170.0,
+                "Drop a protected PDF here or click to browse",
+                "The file you want to remove the password from",
+            ) && let Some(p) = pick_file("PDF", PDF_EXT)
+            {
+                self.path = Some(p);
+            }
+            return None;
+        }
         let (name, info) = match &self.path {
             Some(p) => (file_name(p), file_size(p)),
             None => ("No file selected".into(), "Choose a protected PDF".into()),
