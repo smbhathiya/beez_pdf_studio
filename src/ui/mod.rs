@@ -211,6 +211,8 @@ impl App {
             }
         }
 
+        // Tools grouped by category, as before.
+        let card_w = ((ui.available_width() - 24.0) / 3.0).clamp(240.0, 360.0);
         for (group, tools) in Tool::GROUPS {
             ui.add_space(24.0);
             ui.label(strong(group).size(15.0));
@@ -218,14 +220,12 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(12.0);
                 for &t in tools {
-                    if tool_card(ui, t) {
+                    if tool_card(ui, t, card_w) {
                         self.tool = Some(t);
                     }
                 }
             });
         }
-        ui.add_space(32.0);
-        self.update.footer(ui);
         ui.add_space(16.0);
     }
 
@@ -433,9 +433,8 @@ fn theme_toggle(ui: &mut egui::Ui) {
 }
 
 /// A launcher card on the Home screen. Returns true when clicked.
-fn tool_card(ui: &mut egui::Ui, tool: Tool) -> bool {
+fn tool_card(ui: &mut egui::Ui, tool: Tool, width: f32) -> bool {
     let p = Palette::current(ui);
-    let width = ((ui.available_width() - 24.0) / 3.0).clamp(240.0, 360.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 92.0), Sense::click());
     let painter = ui.painter();
     let hovered = resp.hovered();
@@ -526,6 +525,17 @@ impl eframe::App for App {
         }
 
         let bg = Palette::current(ui).bg;
+        // Version + "Check for updates", pinned to the bottom of the Home screen.
+        if self.tool.is_none() {
+            egui::Panel::bottom("home_footer")
+                .frame(egui::Frame::new().fill(bg).inner_margin(Margin {
+                    left: 40,
+                    right: 40,
+                    top: 6,
+                    bottom: 10,
+                }))
+                .show(ui, |ui| self.update.footer(ui));
+        }
         if self.running.is_some() || self.status.is_some() {
             egui::Panel::bottom("infobar")
                 .frame(egui::Frame::new().fill(bg).inner_margin(Margin {
