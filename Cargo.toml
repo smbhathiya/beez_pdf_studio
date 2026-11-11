@@ -11,3 +11,4 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 lopdf = "0.47.0"
 rayon = "1.12.0"
 rfd = "0.18.0"
+self_update = { version = "1.3.3", default-features = false, features = ["ureq", "rustls", "github", "archive-zip", "compression-zip-deflate"] }

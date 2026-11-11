@@ -637,18 +637,17 @@ impl OrganizeState {
                 ui,
                 any,
                 &labeled(I_SAVE, &format!("Save {} pages as PDF", self.tiles.len())),
-            )
-                && let Some(out) = save_as(
-                    self.sources.first().map(|p| p.as_path()),
-                    "organized",
-                    "pdf",
-                ) {
-                    let sources = self.sources.clone();
-                    let pages: Vec<PageRef> = self.tiles.iter().map(|t| t.r).collect();
-                    action = task("Saving organized PDF", move || {
-                        pdf::assemble::organize(&sources, &pages, &out)
-                    });
-                }
+            ) && let Some(out) = save_as(
+                self.sources.first().map(|p| p.as_path()),
+                "organized",
+                "pdf",
+            ) {
+                let sources = self.sources.clone();
+                let pages: Vec<PageRef> = self.tiles.iter().map(|t| t.r).collect();
+                action = task("Saving organized PDF", move || {
+                    pdf::assemble::organize(&sources, &pages, &out)
+                });
+            }
             ui.add_space(8.0);
             caption(
                 ui,
@@ -1527,9 +1526,10 @@ impl UnlockState {
         };
         setting(ui, I_LOCK, &name, &info, |ui| {
             if ui.button(labeled(I_OPEN, "Browse…")).clicked()
-                && let Some(p) = pick_file("PDF", PDF_EXT) {
-                    self.path = Some(p);
-                }
+                && let Some(p) = pick_file("PDF", PDF_EXT)
+            {
+                self.path = Some(p);
+            }
         });
         section(ui, "Password");
         setting(
