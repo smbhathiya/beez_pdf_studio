@@ -6,14 +6,13 @@ pub mod compress;
 pub mod images;
 pub mod links;
 pub mod meta;
-pub mod stamp;
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use lopdf::{Document, Object, ObjectId};
 
 /// Load a PDF from disk. Files protected with only an owner password open transparently.
 pub fn load(path: &Path) -> Result<Document> {
@@ -154,142 +153,6 @@ impl VisualFrame {
         let (dx, dy) = (x - e, y - f);
         (a * dx + b * dy, c * dx + d * dy)
     }
-
-    pub fn cm(&self) -> String {
-        let m = self.matrix;
-        format!("{} {} {} {} {} {} cm\n", m[0], m[1], m[2], m[3], m[4], m[5])
-    }
-}
-
-/// Give the page its own direct `/Resources` dictionary (copying inherited / shared ones)
-/// so we can add fonts and graphics states without touching other pages.
-fn own_resources(doc: &mut Document, page_id: ObjectId) -> Result<()> {
-    let mut res = match inherited(doc, page_id, b"Resources") {
-        Some(o) => doc
-            .dereference(&o)
-            .ok()
-            .and_then(|(_, o)| o.as_dict().ok().cloned())
-            .unwrap_or_default(),
-        None => Dictionary::new(),
-    };
-    for key in [&b"Font"[..], b"ExtGState", b"XObject"] {
-        if let Ok(Object::Reference(id)) = res.get(key) {
-            let inner = doc.get_dictionary(*id).cloned().unwrap_or_default();
-            res.set(key, Object::Dictionary(inner));
-        }
-    }
-    doc.get_dictionary_mut(page_id)?
-        .set("Resources", Object::Dictionary(res));
-    Ok(())
-}
-
-/// Add a named resource (e.g. category `Font`, name `F1`) to a page.
-pub fn add_resource(
-    doc: &mut Document,
-    page_id: ObjectId,
-    category: &str,
-    name: &str,
-    value: Object,
-) -> Result<()> {
-    own_resources(doc, page_id)?;
-    let page = doc.get_dictionary_mut(page_id)?;
-    let res = page.get_mut(b"Resources")?.as_dict_mut()?;
-    if !matches!(res.get(category.as_bytes()), Ok(Object::Dictionary(_))) {
-        res.set(category, Object::Dictionary(Dictionary::new()));
-    }
-    res.get_mut(category.as_bytes())?
-        .as_dict_mut()?
-        .set(name, value);
-    Ok(())
-}
-
-/// Draw extra content on a page, isolated from the page's own graphics state.
-/// With `under = true` the new content is painted below the existing content.
-pub fn overlay(doc: &mut Document, page_id: ObjectId, ops: &str, under: bool) -> Result<()> {
-    let existing: Vec<Object> = {
-        let page = doc.get_dictionary(page_id)?;
-        match page.get(b"Contents") {
-            Ok(obj) => match doc.dereference(obj) {
-                Ok((_, Object::Array(a))) => a.clone(),
-                Ok((Some(id), Object::Stream(_))) => vec![Object::Reference(id)],
-                _ => vec![],
-            },
-            Err(_) => vec![],
-        }
-    };
-    let body = format!("q\n{ops}\nQ\n");
-    let mut contents = Vec::with_capacity(existing.len() + 2);
-    if under || existing.is_empty() {
-        let id = doc.add_object(Stream::new(Dictionary::new(), body.into_bytes()));
-        contents.push(Object::Reference(id));
-        contents.extend(existing);
-    } else {
-        let open = doc.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
-        let close = doc.add_object(Stream::new(
-            Dictionary::new(),
-            format!("Q\n{body}").into_bytes(),
-        ));
-        contents.push(Object::Reference(open));
-        contents.extend(existing);
-        contents.push(Object::Reference(close));
-    }
-    doc.get_dictionary_mut(page_id)?
-        .set("Contents", Object::Array(contents));
-    Ok(())
-}
-
-/// Encode text for a standard 14 font (WinAnsi). Unsupported characters become `?`.
-pub fn win_ansi(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|c| match c as u32 {
-            0x20..=0x7E | 0xA0..=0xFF => c as u8,
-            0x2013 => 0x96,
-            0x2014 => 0x97,
-            0x2018 => 0x91,
-            0x2019 => 0x92,
-            0x201C => 0x93,
-            0x201D => 0x94,
-            0x2022 => 0x95,
-            0x20AC => 0x80,
-            _ => b'?',
-        })
-        .collect()
-}
-
-/// Escape bytes for a PDF literal string `( ... )` inside a content stream.
-pub fn pdf_literal(bytes: &[u8]) -> String {
-    let mut s = String::from("(");
-    for &b in bytes {
-        match b {
-            b'(' | b')' | b'\\' => {
-                s.push('\\');
-                s.push(b as char);
-            }
-            0x20..=0x7E => s.push(b as char),
-            _ => s.push_str(&format!("\\{b:03o}")),
-        }
-    }
-    s.push(')');
-    s
-}
-
-/// Approximate Helvetica advance width of a string, in text-space units (1/1000 em).
-pub fn helvetica_width(bytes: &[u8]) -> f32 {
-    const W: [u16; 95] = [
-        278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556,
-        556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722,
-        722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722,
-        667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556,
-        556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500,
-        500, 334, 260, 334, 584,
-    ];
-    bytes
-        .iter()
-        .map(|&b| match b {
-            0x20..=0x7E => W[(b - 0x20) as usize] as f32,
-            _ => 556.0,
-        })
-        .sum()
 }
 
 /// Parse a page selection such as `1-3, 5, 8-` into ranges (1-based, inclusive).
@@ -391,7 +254,7 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use lopdf::dictionary;
+    use lopdf::{Stream, dictionary};
 
     /// Build a simple n-page document in memory for tests.
     pub fn sample(n: u32) -> Document {
