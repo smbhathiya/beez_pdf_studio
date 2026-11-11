@@ -7,10 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
 use lopdf::{Document, EncryptionState, EncryptionVersion, Object, Permissions, StringFormat};
 
+use super::progress::Progress;
 use super::{
     decode_text_string, encode_text_string, expand_ranges, human_size, load, page_box,
     parse_ranges, save,
@@ -106,8 +107,10 @@ fn pdf_date_now() -> String {
 }
 
 /// `fields` holds values for [`FIELDS`]; empty strings remove the entry.
-pub fn write_info(input: &Path, output: &Path, fields: &[String]) -> Result<String> {
+pub fn write_info(input: &Path, output: &Path, fields: &[String], pr: &Progress) -> Result<String> {
+    pr.set(0.0, "Reading the PDF");
     let mut doc = load(input)?;
+    pr.check()?;
     let mut info = doc
         .trailer
         .get(b"Info")
@@ -132,15 +135,27 @@ pub fn write_info(input: &Path, output: &Path, fields: &[String]) -> Result<Stri
     }
     let id = doc.add_object(info);
     doc.trailer.set("Info", id);
+    pr.check()?;
+    pr.set(0.8, "Saving");
     save(&mut doc, output)?;
+    pr.set(1.0, "Done");
     Ok(format!("Metadata saved → {}", output.display()))
 }
 
-pub fn extract_text(input: &Path, output: &Path, pages: &str) -> Result<String> {
+pub fn extract_text(input: &Path, output: &Path, pages: &str, pr: &Progress) -> Result<String> {
+    pr.set(0.0, "Reading the PDF");
     let doc = load(input)?;
     let list = expand_ranges(&parse_ranges(pages, super::page_count(&doc))?);
     let mut text = String::new();
-    for p in &list {
+    for (i, p) in list.iter().enumerate() {
+        pr.check()?;
+        pr.step(
+            0.05,
+            0.95,
+            i,
+            list.len(),
+            format!("Reading text of page {} of {}", i + 1, list.len()),
+        );
         text.push_str(&format!("===== Page {p} =====\n"));
         text.push_str(
             &doc.extract_text(&[*p])
@@ -148,7 +163,10 @@ pub fn extract_text(input: &Path, output: &Path, pages: &str) -> Result<String> 
         );
         text.push('\n');
     }
-    fs::write(output, &text).with_context(|| format!("Could not write {}", output.display()))?;
+    pr.check()?;
+    pr.set(0.97, "Saving");
+    super::write_file(output, text.as_bytes())?;
+    pr.set(1.0, "Done");
     Ok(format!(
         "Extracted {} characters from {} page(s) → {}",
         text.chars().count(),
@@ -187,6 +205,7 @@ pub fn protect(
     user_pw: &str,
     owner_pw: &str,
     allow: Allow,
+    pr: &Progress,
 ) -> Result<String> {
     if user_pw.is_empty() && owner_pw.is_empty() {
         bail!("Enter at least one password");
@@ -196,7 +215,10 @@ pub fn protect(
     } else {
         owner_pw
     };
+    pr.set(0.0, "Reading the PDF");
     let mut doc = load(input)?;
+    pr.check()?;
+    pr.set(0.4, "Encrypting");
     doc.encryption_state = None;
 
     if !doc.trailer.has(b"ID") {
@@ -251,11 +273,15 @@ pub fn protect(
         EncryptionState::try_from(version).map_err(|e| anyhow!("Encryption failed: {e:?}"))?;
     doc.encrypt(&state)
         .map_err(|e| anyhow!("Encryption failed: {e}"))?;
+    pr.check()?;
+    pr.set(0.8, "Saving");
     save(&mut doc, output)?;
+    pr.set(1.0, "Done");
     Ok(format!("Protected with AES-128 → {}", output.display()))
 }
 
-pub fn unlock(input: &Path, output: &Path, password: &str) -> Result<String> {
+pub fn unlock(input: &Path, output: &Path, password: &str, pr: &Progress) -> Result<String> {
+    pr.set(0.0, "Opening the PDF");
     let mut doc = Document::load_with_password(input, password)
         .map_err(|e| anyhow!("Could not open {} – wrong password? ({e})", input.display()))?;
     if doc.encryption_state.is_none() && !doc.is_encrypted() {
@@ -266,7 +292,10 @@ pub fn unlock(input: &Path, output: &Path, password: &str) -> Result<String> {
             .map_err(|e| anyhow!("Wrong password ({e})"))?;
     }
     doc.encryption_state = None;
+    pr.check()?;
+    pr.set(0.8, "Saving");
     save(&mut doc, output)?;
+    pr.set(1.0, "Done");
     Ok(format!("Password removed → {}", output.display()))
 }
 
@@ -285,22 +314,30 @@ mod tests {
         let mut fields = vec![String::new(); 6];
         fields[0] = "Hello Wörld".into();
         fields[1] = "UtilBee".into();
-        write_info(&a, &b, &fields).unwrap();
+        write_info(&a, &b, &fields, &Progress::default()).unwrap();
         let info = read_info(&b).unwrap();
         assert_eq!(info.fields[0], "Hello Wörld");
         assert_eq!(info.fields[1], "UtilBee");
         assert_eq!(info.pages, 2);
 
         let t = dir.join("t.txt");
-        extract_text(&b, &t, "2").unwrap();
+        extract_text(&b, &t, "2", &Progress::default()).unwrap();
         assert!(fs::read_to_string(&t).unwrap().contains("Page 2"));
 
         let locked = dir.join("locked.pdf");
-        protect(&b, &locked, "secret", "owner", Allow::default()).unwrap();
+        protect(
+            &b,
+            &locked,
+            "secret",
+            "owner",
+            Allow::default(),
+            &Progress::default(),
+        )
+        .unwrap();
         assert!(load(&locked).is_err(), "should need a password");
         let open = dir.join("open.pdf");
-        assert!(unlock(&locked, &open, "nope").is_err());
-        unlock(&locked, &open, "secret").unwrap();
+        assert!(unlock(&locked, &open, "nope", &Progress::default()).is_err());
+        unlock(&locked, &open, "secret", &Progress::default()).unwrap();
         let back = Document::load(&open).unwrap();
         assert!(back.encryption_state.is_none());
         assert!(back.extract_text(&[1]).unwrap().contains("Page 1"));

@@ -1,4 +1,4 @@
-# 🐝 UtilBee PDF Studio
+# 🐝 Beez PDF Studio
 
 A fast desktop app for working with PDFs, written in Rust. Everything runs on your own computer and no files are uploaded.
 
@@ -38,6 +38,20 @@ There are also two optional settings:
 - **Limit resolution:** downscales very large images before converting.
 
 Images are processed in parallel. Example: three screenshot PNGs totalling 246 KB were embedded in 211 KB, pixel for pixel identical.
+
+### Page previews
+
+Every PDF tool shows real thumbnails of all pages, rendered in the app with [hayro](https://github.com/LaurenzV/hayro) (pure Rust, so no extra DLLs are needed):
+
+- **Page Organizer:** page tiles show the actual pages, including any rotation you applied. **Drag** pages (or a selection) to reorder them, drag them onto the **delete zone** that appears at the bottom to remove them (or press **Delete**), and double-click a page to open it full size.
+- **Merge:** a strip of pages under each file. Pages outside the page selection are faded. Drag a file by its **☰ handle** to change the merge order, or onto the delete zone to remove it.
+- **Images to PDF:** a thumbnail grid of the images in page order. Drag to reorder, drop on the delete zone (or click **×**) to remove, and click an image to view it large.
+- **Split & Extract:** each page shows which output file it goes to (`File 1`, `File 2`…), and extracted pages are highlighted.
+- **Link Editor:** a visual editor. Pick a page in the list on the left, **drag on the large page to draw a link area**, then type the web address (or choose a page to jump to) in the panel on the right. Existing links show in red (click one to remove it) and new links in blue (drag a new box to move it).
+- **Compress, Extract Text, Properties, Protect:** a grid of every page.
+- **Page viewer:** click any page to open it large. Use ← / → for previous and next, + / − to zoom, and Esc to close.
+
+Thumbnails render on a background thread, visible pages first, so even long documents open instantly.
 
 Other conveniences:
 
@@ -134,7 +148,28 @@ opt-level = 3
 
 ---
 
-## 5. Create a release
+## 5. Installer & icon
+
+- **Icon:** [`assets/icon.ico`](assets/icon.ico) is embedded into `util_bee.exe` by [`build.rs`](build.rs) (Explorer, taskbar, Start menu, Task Manager), together with the product name and publisher (**Beez**). To redesign it, edit [`examples/make_icon.rs`](examples/make_icon.rs) and run `cargo run --example make_icon`.
+- **Installer:** [`installer/utilbee.iss`](installer/utilbee.iss) is an [Inno Setup](https://jrsoftware.org/isinfo.php) script. The installer:
+  - installs for the current user into `%LOCALAPPDATA%\Programs\Beez PDF Studio`, so no administrator rights are needed and self-update keeps working,
+  - adds a Start menu shortcut, and optionally a Desktop shortcut and an **Open with** entry for PDF files,
+  - registers an uninstaller under *Settings → Apps*,
+  - upgrades an existing installation in place.
+
+Build the installer locally (requires Inno Setup 6):
+
+```powershell
+cargo build --release
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.1 installer\utilbee.iss
+# → dist\Beez-PDF-Studio-Setup-v0.1.1.exe
+```
+
+The release workflow builds and attaches it automatically.
+
+---
+
+## 6. Create a release
 
 Releases are built and published automatically by GitHub Actions
 ([.github/workflows/release.yml](.github/workflows/release.yml)) when you push a version tag.
@@ -165,10 +200,11 @@ On the repository's **Actions** tab, the *Release* workflow:
 
 1. runs the tests,
 2. builds `util_bee.exe` on Windows,
-3. zips it as `UtilBee-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
-4. creates the GitHub Release with auto-generated notes and the zip attached.
+3. zips it as `Beez-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
+4. builds the installer `Beez-PDF-Studio-Setup-v0.2.0.exe` with Inno Setup,
+5. creates the GitHub Release with download notes and both files attached.
 
-When the workflow finishes, installed apps offer the update the next time they start (see [Auto-update](#6-auto-update)).
+When the workflow finishes, installed apps offer the update the next time they start (see [Auto-update](#7-auto-update)).
 
 ### Manual release (without GitHub Actions)
 
@@ -176,8 +212,8 @@ To publish by hand, the asset name and zip layout must match what the updater ex
 
 ```powershell
 $v = "0.2.0"
-Compress-Archive -Path target\release\util_bee.exe -DestinationPath "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" -Force
-gh release create "v$v" "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --title "UtilBee PDF Studio v$v" --generate-notes
+Compress-Archive -Path target\release\util_bee.exe -DestinationPath "Beez-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" -Force
+gh release create "v$v" "Beez-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --title "Beez PDF Studio v$v" --generate-notes
 ```
 
 - The file name must contain `x86_64-pc-windows-msvc`.
@@ -195,13 +231,13 @@ gh release create "v$v" "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --ti
 
 ---
 
-## 6. Auto-update
+## 7. Auto-update
 
 The app updates itself from GitHub Releases ([src/updater.rs](src/updater.rs)):
 
 1. **On start-up** it checks the latest release in the background. If the user is offline or nothing is newer, nothing is shown.
-2. If a newer version exists, a bar appears: **"Version 0.2.0 is available"**, with **Update now**, **What's new** and dismiss buttons.
-3. **Update now** downloads the release zip, replaces the running `.exe` in place, and offers **Restart now**.
+2. If a newer version exists, a dialog pops up: **"Update available"**, with **Update now**, **What's new** and **Later**.
+3. **Update now** downloads the release zip in the background, replaces the running `.exe` in place, and the dialog then offers **Restart now**.
 4. Users can also click **Check for updates** at the bottom of the Home screen at any time.
 
 Requirements:
@@ -221,6 +257,10 @@ Requirements:
 util_bee/
 ├── Cargo.toml            dependencies & version
 ├── README.md
+├── build.rs              embeds the icon and version info into the .exe
+├── assets/               icon.ico / icon.png
+├── examples/make_icon.rs generates the icon
+├── installer/utilbee.iss Inno Setup installer script
 ├── .github/workflows/
 │   └── release.yml   builds & publishes a release when a vX.Y.Z tag is pushed
 └── src/
@@ -230,6 +270,7 @@ util_bee/
     │   ├── mod.rs        app shell: Home launcher, tool pages, InfoBar, background tasks
     │   ├── theme.rs      Windows 11 look: fonts, Fluent icons, colors, cards, buttons
     │   ├── update.rs     update banner (check, update now, restart)
+    │   ├── preview.rs    page thumbnails, page grid, full-size page viewer
     │   └── tools.rs      one panel per tool
     └── pdf/
         ├── mod.rs        shared helpers: page boxes, rotation-aware coordinates, ranges
@@ -237,6 +278,7 @@ util_bee/
         ├── compress.rs   structural + image compression
         ├── images.rs     images → PDF with lossless optimization
         ├── links.rs      link annotations
+        ├── render.rs     page rendering for previews (hayro, background threads)
         └── meta.rs       metadata, text extraction, encryption
 ```
 
@@ -250,6 +292,8 @@ util_bee/
 | [`rfd`](https://github.com/PolyMeilex/rfd) | Native open, save and folder dialogs |
 | [`rayon`](https://github.com/rayon-rs/rayon) | Parallel image compression |
 | [`self_update`](https://github.com/jaemk/self_update) | Checking GitHub Releases and replacing the executable |
+| [`hayro`](https://github.com/LaurenzV/hayro) | Rendering page previews (pure Rust) |
+| [`winresource`](https://github.com/BenjaminRi/winresource) | Embedding the icon into the .exe |
 | [`flate2`](https://github.com/rust-lang/flate2-rs) | Maximum-level Deflate for images |
 | [`anyhow`](https://github.com/dtolnay/anyhow) | Error handling |
 
@@ -257,6 +301,6 @@ util_bee/
 
 ## Known limitations
 
-- Page tiles show page shapes and numbers, not rendered previews. Rendering previews would need a PDF rasterizer such as pdfium.
+- Password-protected PDFs show no preview until they are unlocked. Very unusual PDF features may render slightly differently from Adobe Reader, but the saved files are not affected, because previews are display-only.
 - Merge, split and organize keep page content, annotations and links. They drop document-level features: bookmarks, form field definitions and attachments.
 - The Windows 11 fonts and icons are loaded from `C:\Windows\Fonts`. On other systems the app falls back to egui's built-in fonts, and the icons will not display.

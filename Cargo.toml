@@ -1,14 +1,18 @@
 [package]
 name = "util_bee"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
 eframe = "0.37.0"
 flate2 = "1.1.11"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+hayro = "0.9.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
 lopdf = "0.47.0"
 rayon = "1.12.0"
 rfd = "0.18.0"
 self_update = { version = "1.3.3", default-features = false, features = ["ureq", "rustls", "github", "archive-zip", "compression-zip-deflate"] }
+
+[build-dependencies]
+winresource = "0.1.34"

@@ -1,6 +1,7 @@
 //! Application shell: Home (tool launcher) → full-window tool pages with a back button,
 //! a Windows 11 style InfoBar for results, and background task handling.
 
+mod preview;
 mod theme;
 mod tools;
 mod update;
@@ -13,6 +14,8 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 
+use crate::pdf::progress::{Progress, is_cancelled};
+use preview::Thumbs;
 use theme::*;
 use tools::*;
 use update::UpdateUi;
@@ -20,6 +23,17 @@ use update::UpdateUi;
 struct Running {
     label: String,
     rx: mpsc::Receiver<Result<String>>,
+    /// Shared with the task: progress reports flow in, the cancel request flows out.
+    progress: Progress,
+    started: std::time::Instant,
+}
+
+/// How the last task ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    Failed,
+    Cancelled,
 }
 
 pub struct App {
@@ -27,7 +41,7 @@ pub struct App {
     tool: Option<Tool>,
     running: Option<Running>,
     /// Last result: (success, message).
-    status: Option<(bool, String)>,
+    status: Option<(Outcome, String)>,
     merge: MergeState,
     split: SplitState,
     organize: OrganizeState,
@@ -39,6 +53,8 @@ pub struct App {
     protect: ProtectState,
     unlock: UnlockState,
     update: UpdateUi,
+    /// Page thumbnails and the full-size page viewer, shared by all tools.
+    thumbs: Thumbs,
 }
 
 impl App {
@@ -60,6 +76,7 @@ impl App {
             protect: Default::default(),
             unlock: Default::default(),
             update: UpdateUi::new(&cc.egui_ctx),
+            thumbs: Thumbs::default(),
         };
         // Files passed on the command line (e.g. "Open with…").
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -72,24 +89,36 @@ impl App {
     fn start(&mut self, ctx: &egui::Context, (label, job): Task) {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
+        let progress = Progress::default();
+        let task_progress = progress.clone();
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("Unexpected internal error")));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&task_progress)))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Unexpected internal error")));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
         self.status = None;
-        self.running = Some(Running { label, rx });
+        self.running = Some(Running {
+            label,
+            rx,
+            progress,
+            started: std::time::Instant::now(),
+        });
     }
 
     fn poll(&mut self) {
         let Some(r) = &self.running else { return };
         let result = match r.rx.try_recv() {
-            Ok(Ok(msg)) => (true, msg),
-            Ok(Err(e)) => (false, format!("{e:#}")),
+            Ok(Ok(msg)) => (Outcome::Done, msg),
+            Ok(Err(e)) if is_cancelled(&e) => (
+                Outcome::Cancelled,
+                "The operation was cancelled. Nothing was saved.".to_string(),
+            ),
+            Ok(Err(e)) => (Outcome::Failed, format!("{e:#}")),
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                (false, "The task stopped unexpectedly".into())
+                (Outcome::Failed, "The task stopped unexpectedly".into())
             }
         };
         self.status = Some(result);
@@ -98,6 +127,10 @@ impl App {
 
     /// Route opened/dropped files to a tool. On Home, the file type picks the tool.
     fn open_files(&mut self, tool: Option<Tool>, files: Vec<PathBuf>) {
+        // Re-opened files may have changed on disk: drop their old previews.
+        for f in &files {
+            self.thumbs.invalidate(f);
+        }
         let pdfs: Vec<PathBuf> = files
             .iter()
             .filter(|p| has_ext(p, PDF_EXT))
@@ -150,7 +183,6 @@ impl App {
     // ---------------------------------------------------------------------------------
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        let p = Palette::current(ui);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(title("PDF Studio"));
@@ -163,39 +195,13 @@ impl App {
 
         // Drop zone
         ui.add_space(20.0);
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 96.0), Sense::click());
-        let hovered = resp.hovered();
-        ui.painter()
-            .rect_filled(rect, 8.0, if hovered { p.card_hover } else { p.card });
-        ui.painter().rect_stroke(
-            rect,
-            8.0,
-            Stroke::new(
-                1.0,
-                if hovered {
-                    p.accent
-                } else {
-                    p.text2.gamma_multiply(0.5)
-                },
-            ),
-            StrokeKind::Inside,
+        let clicked = drop_zone(
+            ui,
+            150.0,
+            "Drop files here or click to browse",
+            "PDFs open in the Page Organizer · images open in Images to PDF",
         );
-        ui.painter().text(
-            rect.center() - Vec2::new(0.0, 12.0),
-            Align2::CENTER_CENTER,
-            format!("{I_OPEN}   Open or drop files here"),
-            FontId::new(16.0, semibold()),
-            p.text,
-        );
-        ui.painter().text(
-            rect.center() + Vec2::new(0.0, 14.0),
-            Align2::CENTER_CENTER,
-            "PDFs open in the Page Organizer and images open in Images to PDF",
-            FontId::proportional(12.0),
-            p.text2,
-        );
-        if resp.clicked() {
+        if clicked {
             let files = rfd::FileDialog::new()
                 .add_filter("PDFs and images", &[PDF_EXT, IMG_EXT].concat())
                 .pick_files()
@@ -258,21 +264,21 @@ impl App {
         ui.add_space(12.0);
 
         let body = |app: &mut Self, ui: &mut egui::Ui| match tool {
-            Tool::Organize => app.organize.ui(ui),
-            Tool::Merge => app.merge.ui(ui),
-            Tool::Split => app.split.ui(ui),
-            Tool::Compress => app.compress.ui(ui),
-            Tool::ImagesToPdf => app.images.ui(ui),
-            Tool::Links => app.links.ui(ui),
-            Tool::Metadata => app.meta.ui(ui),
-            Tool::ExtractText => app.text.ui(ui),
-            Tool::Protect => app.protect.ui(ui),
-            Tool::Unlock => app.unlock.ui(ui),
+            Tool::Organize => app.organize.ui(ui, &mut app.thumbs),
+            Tool::Merge => app.merge.ui(ui, &mut app.thumbs),
+            Tool::Split => app.split.ui(ui, &mut app.thumbs),
+            Tool::Compress => app.compress.ui(ui, &mut app.thumbs),
+            Tool::ImagesToPdf => app.images.ui(ui, &mut app.thumbs),
+            Tool::Links => app.links.ui(ui, &mut app.thumbs),
+            Tool::Metadata => app.meta.ui(ui, &mut app.thumbs),
+            Tool::ExtractText => app.text.ui(ui, &mut app.thumbs),
+            Tool::Protect => app.protect.ui(ui, &mut app.thumbs),
+            Tool::Unlock => app.unlock.ui(ui, &mut app.thumbs),
         };
         // Tools are disabled while a task runs or while an update is being installed.
         let busy = self.running.is_some() || self.update.busy();
         ui.add_enabled_ui(!busy, |ui| {
-            if tool == Tool::Organize {
+            if matches!(tool, Tool::Organize | Tool::Links) {
                 // The organizer fills the window and scrolls its own page grid.
                 body(self, ui)
             } else {
@@ -281,7 +287,8 @@ impl App {
                     .id_salt(tool.name())
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(920.0);
+                        // Use the full window width (leave room for the scroll bar).
+                        ui.set_width(ui.available_width() - 12.0);
                         let r = body(self, ui);
                         ui.add_space(24.0);
                         r
@@ -296,26 +303,72 @@ impl App {
     fn info_bar(&mut self, ui: &mut egui::Ui) {
         let p = Palette::current(ui);
         if let Some(r) = &self.running {
+            let pr = r.progress.clone();
+            let cancelling = pr.is_cancelled();
+            let elapsed = r.started.elapsed().as_secs();
+            let fraction = pr.fraction();
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(strong(format!("{}…", r.label)));
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let title = if cancelling {
+                            "Cancelling…".to_string()
+                        } else {
+                            format!("{}…", r.label)
+                        };
+                        ui.label(strong(title));
+                        let stage = pr.stage();
+                        let mut detail = if stage.is_empty() {
+                            "Starting".to_string()
+                        } else {
+                            stage
+                        };
+                        if let Some(f) = fraction {
+                            detail = format!("{:.0}%  ·  {detail}", f * 100.0);
+                        }
+                        detail.push_str(&format!(
+                            "  ·  {}:{:02} elapsed",
+                            elapsed / 60,
+                            elapsed % 60
+                        ));
+                        caption(ui, &detail);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(labeled(I_CLOSE, "Cancel"))
+                            .min_size(Vec2::new(100.0, 32.0));
+                        if ui
+                            .add_enabled(!cancelling, btn)
+                            .on_hover_text("Stop now. Nothing is saved.")
+                            .clicked()
+                        {
+                            pr.cancel();
+                        }
+                    });
                 });
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .animate(true)
-                        .desired_height(4.0),
-                );
+                ui.add_space(6.0);
+                let bar = match fraction {
+                    // Real progress when the task reports it…
+                    Some(f) => egui::ProgressBar::new(f),
+                    // …otherwise an animated "working" bar.
+                    None => egui::ProgressBar::new(((ui.input(|i| i.time) * 0.6) % 1.0) as f32),
+                };
+                ui.add(bar.desired_height(6.0).fill(p.accent).corner_radius(3.0));
             });
+            // Keep the elapsed time and the bar moving.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
-        let Some((ok, msg)) = self.status.clone() else {
+        let Some((outcome, msg)) = self.status.clone() else {
             return;
         };
-        let (bg, fg, icon, head) = if ok {
-            (p.success_bg, p.success, I_CHECK, "Done")
-        } else {
-            (p.error_bg, p.error, I_ERROR, "Something went wrong")
+        let ok = outcome == Outcome::Done;
+        let (bg, fg, icon, head) = match outcome {
+            Outcome::Done => (p.success_bg, p.success, I_CHECK, "Done"),
+            Outcome::Failed => (p.error_bg, p.error, I_ERROR, "Something went wrong"),
+            Outcome::Cancelled => (p.card, p.text2, I_INFO, "Cancelled"),
         };
         let mut close = false;
         egui::Frame::new()
@@ -448,6 +501,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         self.update.poll();
+        self.thumbs.poll(ui.ctx());
         let ctx = ui.ctx().clone();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -461,8 +515,11 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             self.open_files(self.tool, dropped);
         }
+        // Esc goes back to Home (unless it is closing the page viewer).
         if self.tool.is_some()
             && self.running.is_none()
+            && !self.thumbs.viewer_open()
+            && !self.update.dialog_open()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.tool = None;
@@ -488,17 +545,14 @@ impl eframe::App for App {
                 top: 28,
                 bottom: 16,
             }))
-            .show(ui, |ui| {
-                self.update.banner(ui);
-                match self.tool {
-                    None => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("home")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.home(ui));
-                    }
-                    Some(tool) => action = self.tool_page(ui, tool),
+            .show(ui, |ui| match self.tool {
+                None => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("home")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.home(ui));
                 }
+                Some(tool) => action = self.tool_page(ui, tool),
             });
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -518,6 +572,9 @@ impl eframe::App for App {
                 p.accent,
             );
         }
+
+        self.thumbs.show_viewer(&ctx);
+        self.update.dialog(&ctx);
 
         if let Some(t) = action {
             self.start(&ctx, t);

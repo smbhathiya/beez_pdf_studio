@@ -4,8 +4,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+};
 
+use super::preview::{
+    self, LARGE, THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header,
+    selected_pages,
+};
 use super::theme::*;
 use crate::pdf::{
     self,
@@ -14,17 +20,18 @@ use crate::pdf::{
     images::{ImageOptions, Orientation, PageSize, Quality},
     links::{ExistingLink, LinkRect, LinkTarget, NewLink},
     meta::{Allow, DocInfo, FIELDS},
+    progress::Progress,
 };
 
 pub const PDF_EXT: &[&str] = &["pdf"];
 pub const IMG_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
 /// Background work: a label for the progress bar and the job itself.
-pub type Task = (String, Box<dyn FnOnce() -> Result<String> + Send>);
+pub type Task = (String, Box<dyn FnOnce(&Progress) -> Result<String> + Send>);
 
 fn task(
     label: impl Into<String>,
-    f: impl FnOnce() -> Result<String> + Send + 'static,
+    f: impl FnOnce(&Progress) -> Result<String> + Send + 'static,
 ) -> Option<Task> {
     Some((label.into(), Box::new(f)))
 }
@@ -177,7 +184,26 @@ impl Source {
     }
 
     /// Returns true when the file changed.
-    fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+    fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> bool {
+        if self.path.is_none() {
+            let picked = drop_zone(
+                ui,
+                170.0,
+                "Drop a PDF here or click to browse",
+                "Choose the PDF file to work on",
+            )
+            .then(|| pick_file("PDF", PDF_EXT))
+            .flatten();
+            ui.add_space(4.0);
+            return match picked {
+                Some(p) => {
+                    thumbs.invalidate(&p);
+                    self.set(p);
+                    true
+                }
+                None => false,
+            };
+        }
         let (name, info) = match &self.path {
             Some(p) => {
                 let pages = if self.pages > 0 {
@@ -205,10 +231,31 @@ impl Source {
         });
         match picked {
             Some(p) => {
+                thumbs.invalidate(&p);
                 self.set(p);
                 true
             }
             None => false,
+        }
+    }
+
+    /// "Pages" section with a thumbnail of every page; `dim` fades pages out.
+    fn preview(&self, ui: &mut egui::Ui, thumbs: &mut Thumbs, dim: impl Fn(u32) -> bool) {
+        if let Some(path) = &self.path
+            && self.pages > 0
+        {
+            pages_header(ui, self.pages);
+            page_grid(
+                ui,
+                thumbs,
+                path,
+                self.pages,
+                |p| TileStyle {
+                    dim: dim(p),
+                    ..Default::default()
+                },
+                |_, _, _| {},
+            );
         }
     }
 }
@@ -249,6 +296,8 @@ fn footer(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
 #[derive(Default)]
 pub struct MergeState {
     items: Vec<(PathBuf, u32, String)>,
+    /// Index of the file being dragged by its handle.
+    drag: Option<usize>,
 }
 
 impl MergeState {
@@ -259,7 +308,7 @@ impl MergeState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         ui.horizontal(|ui| {
             if ui.button(labeled(I_ADD, "Add PDFs…")).clicked() {
                 self.add(pick_files("PDF", PDF_EXT));
@@ -272,49 +321,169 @@ impl MergeState {
             }
         });
         section(ui, "Files, merged from top to bottom");
-        if self.items.is_empty() {
-            card(ui, |ui| {
-                ui.label(secondary(
-                    ui,
-                    "Add two or more PDFs, or drag them onto the window.",
-                ));
-            });
+        if self.items.is_empty()
+            && drop_zone(
+                ui,
+                170.0,
+                "Drop PDF files here or click to browse",
+                "Add two or more PDFs to combine them into one",
+            )
+        {
+            self.add(pick_files("PDF", PDF_EXT));
         }
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let clip = ui.clip_rect();
+        let mut card_rects: Vec<Rect> = Vec::with_capacity(self.items.len());
+        let mut started = None;
         let mut i = 0;
         while i < self.items.len() {
+            let top = ui.cursor().top();
             let removed = card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(secondary(ui, format!("{:>2}", i + 1)));
-                    ui.label(RichText::new(I_DOCUMENT).size(18.0));
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(file_name(&self.items[i].0));
-                        caption(
-                            ui,
-                            &format!(
-                                "{} pages · {}",
-                                self.items[i].1,
-                                file_size(&self.items[i].0)
-                            ),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let removed = row_controls(ui, &mut self.items, i);
-                        if !removed {
-                            ui.add_space(8.0);
-                            pages_field(ui, &mut self.items[i].2, 120.0);
-                            ui.label(secondary(ui, "Pages"));
+                let removed = ui
+                    .horizontal(|ui| {
+                        let grip = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(I_GRIP)
+                                        .size(16.0)
+                                        .color(Palette::current(ui).text2),
+                                )
+                                .sense(Sense::drag()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text(
+                                "Drag to change the order, or onto the red zone to remove",
+                            );
+                        if grip.drag_started() {
+                            started = Some(i);
                         }
-                        removed
+                        ui.label(secondary(ui, format!("{:>2}", i + 1)));
+                        ui.label(RichText::new(I_DOCUMENT).size(18.0));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(file_name(&self.items[i].0));
+                            caption(
+                                ui,
+                                &format!(
+                                    "{} pages · {}",
+                                    self.items[i].1,
+                                    file_size(&self.items[i].0)
+                                ),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let removed = row_controls(ui, &mut self.items, i);
+                            if !removed {
+                                ui.add_space(8.0);
+                                pages_field(ui, &mut self.items[i].2, 120.0);
+                                ui.label(secondary(ui, "Pages"));
+                            }
+                            removed
+                        })
+                        .inner
                     })
-                    .inner
-                })
-                .inner
+                    .inner;
+                if !removed && self.items[i].1 > 0 {
+                    let (path, n, spec) = (&self.items[i].0, self.items[i].1, &self.items[i].2);
+                    let sel = selected_pages(spec, n);
+                    ui.add_space(8.0);
+                    page_strip(ui, thumbs, path, n, |p| {
+                        sel.as_ref().is_some_and(|s| !s.contains(&p))
+                    });
+                }
+                removed
             });
+            card_rects.push(Rect::from_x_y_ranges(
+                ui.max_rect().x_range(),
+                top..=ui.cursor().top() - 4.0,
+            ));
             if !removed {
                 i += 1;
             }
         }
+
+        if !self.items.is_empty() {
+            ui.add_space(4.0);
+            if drop_zone(
+                ui,
+                56.0,
+                "Add more PDFs",
+                "Drop files here or click to browse",
+            ) {
+                self.add(pick_files("PDF", PDF_EXT));
+            }
+            ui.add_space(4.0);
+        }
+
+        // --- Drag files by their handle to reorder or remove them ---------------------
+        if let Some(i) = started {
+            self.drag = Some(i);
+        }
+        if let (Some(from), Some(pos)) = (self.drag, pointer) {
+            let ctx = ui.ctx().clone();
+            let p = Palette::current(ui);
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(r) = card_rects.get(from) {
+                ui.painter().rect_filled(*r, 8.0, p.bg.gamma_multiply(0.7));
+            }
+            let over_trash = preview::trash_zone(&ctx, clip, pos, "file");
+            let insert = (!over_trash).then(|| {
+                card_rects
+                    .iter()
+                    .position(|r| pos.y < r.center().y)
+                    .unwrap_or(card_rects.len())
+            });
+            if let (Some(at), Some(last)) = (insert, card_rects.last()) {
+                let (y, r) = if at < card_rects.len() {
+                    (card_rects[at].top() - 3.0, card_rects[at])
+                } else {
+                    (last.bottom() + 3.0, *last)
+                };
+                preview::drag_painter(&ctx).line_segment(
+                    [
+                        egui::pos2(r.left() + 8.0, y),
+                        egui::pos2(r.right() - 8.0, y),
+                    ],
+                    Stroke::new(4.0, p.accent),
+                );
+            }
+            if let Some((path, n, _)) = self.items.get(from) {
+                let (name, pages) = (file_name(path), *n);
+                egui::Area::new(egui::Id::unique("merge_ghost"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(pos + Vec2::new(14.0, 10.0))
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(p.card)
+                            .stroke(Stroke::new(2.0, p.accent))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(I_DOCUMENT).size(16.0));
+                                    ui.label(strong(name));
+                                    ui.label(secondary(ui, format!("{pages} pages")));
+                                });
+                            });
+                    });
+            }
+            preview::drag_autoscroll(ui, clip, pos, over_trash);
+            if ui.input(|i| i.pointer.any_released()) {
+                if over_trash {
+                    if from < self.items.len() {
+                        self.items.remove(from);
+                    }
+                } else if let Some(at) = insert {
+                    preview::move_item(&mut self.items, from, at);
+                }
+                self.drag = None;
+            }
+            ctx.request_repaint();
+        } else if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+        }
+
         caption(
             ui,
             "Page selection examples: 1-3, 5, 8-end. Leave the field empty to include every page.",
@@ -335,8 +504,8 @@ impl MergeState {
                     ranges: r.clone(),
                 })
                 .collect();
-            return task(format!("Merging {total} pages"), move || {
-                pdf::assemble::merge(&items, &out)
+            return task(format!("Merging {total} pages"), move |pr| {
+                pdf::assemble::merge(&items, &out, pr)
             });
         }
         None
@@ -366,9 +535,9 @@ impl Default for SplitState {
 }
 
 impl SplitState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
         section(ui, "Split method");
         card(ui, |ui| {
             ui.radio_value(
@@ -420,9 +589,60 @@ impl SplitState {
                 dlg = dlg.set_directory(d);
             }
             let dir = dlg.pick_folder()?;
-            return task("Splitting", move || {
-                pdf::assemble::split(&path, mode, n, &spec, &dir)
+            return task("Splitting", move |pr| {
+                pdf::assemble::split(&path, mode, n, &spec, &dir, pr)
             });
+        }
+        if let Some(path) = self.src.path.clone() {
+            let total = self.src.pages;
+            // Which output file each page goes to (None = not included).
+            let groups: Option<Vec<Option<usize>>> = match self.mode {
+                SplitMode::EveryPage => Some((0..total as usize).map(Some).collect()),
+                SplitMode::EveryN => {
+                    let n = self.every.max(1) as usize;
+                    Some((0..total as usize).map(|i| Some(i / n)).collect())
+                }
+                SplitMode::Ranges => pdf::parse_ranges(&self.spec, total).ok().map(|ranges| {
+                    (1..=total)
+                        .map(|p| {
+                            ranges
+                                .iter()
+                                .position(|&(a, b)| (a.min(b)..=a.max(b)).contains(&p))
+                        })
+                        .collect()
+                }),
+                SplitMode::Extract => selected_pages(&self.spec, total)
+                    .map(|sel| (1..=total).map(|p| sel.contains(&p).then_some(0)).collect()),
+            };
+            let extract = self.mode == SplitMode::Extract;
+            pages_header(ui, total);
+            page_grid(
+                ui,
+                thumbs,
+                &path,
+                total,
+                |p| match &groups {
+                    None => TileStyle::default(),
+                    Some(g) => match g[(p - 1) as usize] {
+                        None => TileStyle {
+                            dim: true,
+                            ..Default::default()
+                        },
+                        Some(_) if extract => TileStyle {
+                            highlight: true,
+                            ..Default::default()
+                        },
+                        Some(k) => TileStyle {
+                            badge: Some((
+                                format!("File {}", k + 1),
+                                SOURCE_COLORS[k % SOURCE_COLORS.len()],
+                            )),
+                            ..Default::default()
+                        },
+                    },
+                },
+                |_, _, _| {},
+            );
         }
         None
     }
@@ -445,6 +665,8 @@ pub struct OrganizeState {
     tiles: Vec<Tile>,
     zoom: f32,
     error: Option<String>,
+    /// Tiles being dragged (indices into `tiles`), while a drag is in progress.
+    drag: Option<Vec<usize>>,
 }
 
 impl Default for OrganizeState {
@@ -455,6 +677,7 @@ impl Default for OrganizeState {
             tiles: vec![],
             zoom: 1.0,
             error: None,
+            drag: None,
         }
     }
 }
@@ -524,7 +747,7 @@ impl OrganizeState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         let p = Palette::current(ui);
         let any = !self.tiles.is_empty();
         let nsel = self.tiles.iter().filter(|t| t.selected).count();
@@ -628,7 +851,7 @@ impl OrganizeState {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - footer_h).max(120.0))
-                    .show(ui, |ui| self.grid(ui));
+                    .show(ui, |ui| self.grid(ui, thumbs));
             });
 
         ui.add_space(12.0);
@@ -644,105 +867,91 @@ impl OrganizeState {
             ) {
                 let sources = self.sources.clone();
                 let pages: Vec<PageRef> = self.tiles.iter().map(|t| t.r).collect();
-                action = task("Saving organized PDF", move || {
-                    pdf::assemble::organize(&sources, &pages, &out)
+                action = task("Saving organized PDF", move |pr| {
+                    pdf::assemble::organize(&sources, &pages, &out, pr)
                 });
             }
             ui.add_space(8.0);
             caption(
                 ui,
-                "Click to select. Ctrl+click adds a page, Shift+click selects a range.",
+                "Drag pages to reorder, or onto the delete zone to remove them. Ctrl / Shift selects several; double-click to view a page.",
             );
         });
         action
     }
 
-    fn grid(&mut self, ui: &mut egui::Ui) {
+    fn grid(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) {
         let p = Palette::current(ui);
         if self.tiles.is_empty() {
-            ui.add_space(60.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(I_GRID).size(44.0).color(p.text2));
-                ui.add_space(8.0);
-                ui.label(subtitle("No pages yet"));
-                ui.label(secondary(
-                    ui,
-                    "Add one or more PDFs, or drag them here, to arrange their pages.",
-                ));
-                ui.add_space(12.0);
-                if accent_button(ui, true, &labeled(I_ADD, "Add PDFs")) {
-                    self.add(pick_files("PDF", PDF_EXT));
-                }
-            });
+            let h = (ui.available_height() - 8.0).clamp(170.0, 420.0);
+            if drop_zone(
+                ui,
+                h,
+                "Drop PDF files here or click to browse",
+                "Add one or more PDFs to arrange, rotate, duplicate or delete their pages",
+            ) {
+                self.add(pick_files("PDF", PDF_EXT));
+            }
             return;
         }
         let nsel = self.tiles.iter().filter(|t| t.selected).count();
         let tile = Vec2::new(120.0, 164.0) * self.zoom;
         let modifiers = ui.input(|i| i.modifiers);
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let clip = ui.clip_rect();
         let mut clicked = None;
+        let mut view = None;
+        let mut drag_started = None;
+        let mut rects = Vec::with_capacity(self.tiles.len());
+        let dragging: Vec<usize> = self.drag.clone().unwrap_or_default();
+
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(14.0);
             for (i, t) in self.tiles.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(tile, Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                rects.push(rect);
                 let painter = ui.painter();
                 let color = SOURCE_COLORS[t.r.source % SOURCE_COLORS.len()];
+                let lifted = dragging.contains(&i);
                 if t.selected {
                     painter.rect_filled(rect, 8.0, p.accent.gamma_multiply(0.18));
                     painter.rect_stroke(rect, 8.0, Stroke::new(2.0, p.accent), StrokeKind::Inside);
-                } else if resp.hovered() {
+                } else if resp.hovered() && dragging.is_empty() {
                     painter.rect_filled(rect, 8.0, p.card_hover);
                 }
-                // Page outline with the right aspect ratio after rotation.
-                let (mut w, mut h) = self.sizes[t.r.source]
-                    .get(t.r.page as usize - 1)
-                    .copied()
-                    .unwrap_or((595.0, 842.0));
-                if t.r.rotate % 180 != 0 {
-                    std::mem::swap(&mut w, &mut h);
-                }
-                let area = Vec2::new(tile.x - 28.0, tile.y - 48.0);
-                let s = (area.x / w).min(area.y / h);
-                let page = egui::Rect::from_center_size(
-                    rect.center_top() + Vec2::new(0.0, 12.0 + area.y / 2.0),
-                    Vec2::new(w * s, h * s),
+                // Real page thumbnail, shown with the tile's rotation.
+                let area = Rect::from_min_max(
+                    rect.min + Vec2::new(12.0, 12.0),
+                    rect.max - Vec2::new(12.0, 30.0),
                 );
+                let page = thumbs.paint_page(
+                    ui,
+                    &self.sources[t.r.source],
+                    t.r.page,
+                    THUMB,
+                    t.r.rotate,
+                    area,
+                );
+                let painter = ui.painter();
                 painter.rect_filled(
-                    page.translate(Vec2::new(0.0, 2.0)),
-                    3.0,
-                    Color32::from_black_alpha(50),
-                );
-                painter.rect_filled(page, 3.0, Color32::WHITE);
-                painter.rect_stroke(
-                    page,
-                    3.0,
-                    Stroke::new(1.0, Color32::from_gray(210)),
-                    StrokeKind::Inside,
-                );
-                painter.rect_filled(
-                    egui::Rect::from_min_size(page.min, Vec2::new(page.width(), 3.0)),
-                    egui::CornerRadius {
-                        nw: 3,
-                        ne: 3,
-                        sw: 0,
-                        se: 0,
-                    },
+                    Rect::from_min_size(page.min, Vec2::new(page.width(), 3.0)),
+                    0.0,
                     color,
                 );
-                painter.text(
-                    page.center(),
-                    Align2::CENTER_CENTER,
-                    t.r.page.to_string(),
-                    FontId::new(22.0 * self.zoom, semibold()),
-                    Color32::from_gray(110),
-                );
                 if t.r.rotate != 0 {
-                    painter.text(
-                        page.right_bottom() - Vec2::new(5.0, 4.0),
-                        Align2::RIGHT_BOTTOM,
-                        format!("{}°", t.r.rotate),
-                        FontId::proportional(11.0),
-                        Color32::from_rgb(0x00, 0x5F, 0xB8),
+                    let label = format!("{}°", t.r.rotate);
+                    let galley =
+                        painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
+                    let r = Rect::from_min_size(
+                        page.right_bottom() - galley.size() - Vec2::new(14.0, 8.0),
+                        galley.size() + Vec2::new(10.0, 4.0),
                     );
+                    painter.rect_filled(r, 4.0, p.accent.gamma_multiply(0.9));
+                    painter.galley(r.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE);
+                }
+                if lifted {
+                    // The page is "picked up": leave a faded placeholder behind.
+                    painter.rect_filled(rect, 8.0, p.bg.gamma_multiply(0.75));
                 }
                 painter.text(
                     rect.center_bottom() - Vec2::new(0.0, 10.0),
@@ -751,17 +960,186 @@ impl OrganizeState {
                     FontId::proportional(12.0),
                     if t.selected { p.accent } else { p.text2 },
                 );
-                if resp.clicked() {
+                if resp.drag_started() {
+                    drag_started = Some(i);
+                } else if resp.double_clicked() {
+                    view = Some(i);
+                } else if resp.clicked() {
                     clicked = Some(i);
                 }
-                resp.on_hover_text(format!(
-                    "{} · page {}",
-                    file_name(&self.sources[t.r.source]),
-                    t.r.page
-                ));
+                if dragging.is_empty() {
+                    resp.on_hover_text(format!(
+                        "{} · page {}",
+                        file_name(&self.sources[t.r.source]),
+                        t.r.page
+                    ))
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                }
             }
         });
-        if let Some(i) = clicked {
+
+        // --- Drag & drop ------------------------------------------------------------------
+        if let Some(i) = drag_started {
+            // Dragging a selected page moves the whole selection; otherwise just that page.
+            let set: Vec<usize> = if self.tiles[i].selected {
+                (0..self.tiles.len())
+                    .filter(|&j| self.tiles[j].selected)
+                    .collect()
+            } else {
+                self.tiles.iter_mut().for_each(|t| t.selected = false);
+                self.tiles[i].selected = true;
+                vec![i]
+            };
+            self.drag = Some(set);
+        }
+
+        if let (Some(set), Some(pos)) = (self.drag.clone(), pointer) {
+            let ctx = ui.ctx().clone();
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let fg = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique("organizer_drag"),
+            ));
+
+            // Delete zone along the bottom of the visible grid.
+            let trash = Rect::from_center_size(
+                egui::pos2(clip.center().x, clip.bottom() - 44.0),
+                Vec2::new(clip.width().min(420.0), 60.0),
+            );
+            let over_trash = trash.contains(pos);
+            let (fill, stroke) = if over_trash {
+                (p.error, p.error)
+            } else {
+                (p.error_bg, p.error.gamma_multiply(0.7))
+            };
+            fg.rect(
+                trash,
+                10.0,
+                fill,
+                Stroke::new(2.0, stroke),
+                StrokeKind::Inside,
+            );
+            fg.text(
+                trash.center(),
+                Align2::CENTER_CENTER,
+                format!("{I_DELETE}   Drop here to delete {} page(s)", set.len()),
+                FontId::new(15.0, semibold()),
+                if over_trash { Color32::WHITE } else { p.error },
+            );
+
+            // Where the pages would be inserted: before/after the nearest tile.
+            let insert = (!over_trash).then(|| {
+                rects
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| {
+                        a.1.center()
+                            .distance(pos)
+                            .total_cmp(&b.1.center().distance(pos))
+                    })
+                    .map(|(j, r)| if pos.x < r.center().x { j } else { j + 1 })
+                    .unwrap_or(self.tiles.len())
+            });
+            if let Some(at) = insert {
+                // Vertical marker in the gap where the pages will land.
+                let (r, x) = if at < rects.len() {
+                    (rects[at], rects[at].left() - 7.0)
+                } else {
+                    let last = *rects.last().unwrap();
+                    (last, last.right() + 7.0)
+                };
+                fg.line_segment(
+                    [
+                        egui::pos2(x, r.top() + 6.0),
+                        egui::pos2(x, r.bottom() - 6.0),
+                    ],
+                    Stroke::new(4.0, p.accent),
+                );
+            }
+
+            // Floating preview of the dragged page under the cursor.
+            let first = self.tiles[set[0]].clone();
+            let ghost_size = tile * 0.8;
+            egui::Area::new(egui::Id::unique("organizer_ghost"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(pos + Vec2::new(12.0, 12.0))
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    let (r, _) = ui.allocate_exact_size(ghost_size, Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, 8.0, p.card.gamma_multiply(0.95));
+                    ui.painter().rect_stroke(
+                        r,
+                        8.0,
+                        Stroke::new(2.0, p.accent),
+                        StrokeKind::Inside,
+                    );
+                    thumbs.paint_page(
+                        ui,
+                        &self.sources[first.r.source],
+                        first.r.page,
+                        THUMB,
+                        first.r.rotate,
+                        r.shrink(10.0),
+                    );
+                    if set.len() > 1 {
+                        let c = r.right_top() + Vec2::new(-6.0, 6.0);
+                        ui.painter().circle_filled(c, 12.0, p.accent);
+                        ui.painter().text(
+                            c,
+                            Align2::CENTER_CENTER,
+                            set.len().to_string(),
+                            FontId::new(12.0, semibold()),
+                            p.on_accent,
+                        );
+                    }
+                });
+
+            // Scroll when dragging near the top or bottom edge.
+            if pos.y < clip.top() + 40.0 {
+                ui.scroll_with_delta(Vec2::new(0.0, 12.0));
+            } else if pos.y > clip.bottom() - 90.0 && !over_trash {
+                ui.scroll_with_delta(Vec2::new(0.0, -12.0));
+            }
+
+            if ui.input(|i| i.pointer.any_released()) {
+                if over_trash {
+                    let mut k = 0;
+                    self.tiles.retain(|_| {
+                        k += 1;
+                        !set.contains(&(k - 1))
+                    });
+                } else if let Some(at) = insert {
+                    self.move_tiles(&set, at);
+                }
+                self.drag = None;
+            }
+            ctx.request_repaint();
+        } else if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+        }
+
+        // The Delete key removes the selection.
+        if self.drag.is_none()
+            && nsel > 0
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.tiles.retain(|t| !t.selected);
+        }
+
+        if let Some(i) = view {
+            let items = self
+                .tiles
+                .iter()
+                .map(|t| ViewItem {
+                    path: self.sources[t.r.source].clone(),
+                    page: t.r.page,
+                    rotate: t.r.rotate,
+                })
+                .collect();
+            thumbs.open_viewer(items, i);
+        } else if let Some(i) = clicked {
             if modifiers.shift {
                 let anchor = self.tiles.iter().position(|t| t.selected).unwrap_or(i);
                 let (a, b) = (anchor.min(i), anchor.max(i));
@@ -778,6 +1156,60 @@ impl OrganizeState {
             }
         }
     }
+
+    /// Move the tiles at `set` (sorted indices) so they land before position `at`.
+    fn move_tiles(&mut self, set: &[usize], at: usize) {
+        let moving: Vec<Tile> = set.iter().map(|&i| self.tiles[i].clone()).collect();
+        let before = set.iter().filter(|&&i| i < at).count();
+        let mut k = 0;
+        self.tiles.retain(|_| {
+            k += 1;
+            !set.contains(&(k - 1))
+        });
+        let at = (at - before).min(self.tiles.len());
+        self.tiles.splice(at..at, moving);
+    }
+}
+
+#[cfg(test)]
+mod organize_tests {
+    use super::*;
+
+    fn tiles(n: u32) -> OrganizeState {
+        OrganizeState {
+            tiles: (1..=n)
+                .map(|page| Tile {
+                    r: PageRef {
+                        source: 0,
+                        page,
+                        rotate: 0,
+                    },
+                    selected: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn order(o: &OrganizeState) -> Vec<u32> {
+        o.tiles.iter().map(|t| t.r.page).collect()
+    }
+
+    #[test]
+    fn move_tiles_forward_backward_and_groups() {
+        let mut o = tiles(5);
+        o.move_tiles(&[0], 3); // page 1 dropped before page 4
+        assert_eq!(order(&o), [2, 3, 1, 4, 5]);
+        let mut o = tiles(5);
+        o.move_tiles(&[4], 0); // last page to the front
+        assert_eq!(order(&o), [5, 1, 2, 3, 4]);
+        let mut o = tiles(5);
+        o.move_tiles(&[1, 3], 5); // pages 2 and 4 to the end
+        assert_eq!(order(&o), [1, 3, 5, 2, 4]);
+        let mut o = tiles(5);
+        o.move_tiles(&[2], 2); // dropped where it already is
+        assert_eq!(order(&o), [1, 2, 3, 4, 5]);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -791,9 +1223,9 @@ pub struct CompressState {
 }
 
 impl CompressState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
 
         section(ui, "Compression level");
         card(ui, |ui| {
@@ -898,10 +1330,11 @@ impl CompressState {
         if footer(ui, true, &labeled(I_SAVE, "Compress & save")) {
             let out = save_as(Some(&path), "compressed", "pdf")?;
             let opts = self.opts.clone();
-            return task("Compressing", move || {
-                pdf::compress::compress_file(&path, &out, &opts)
+            return task("Compressing", move |pr| {
+                pdf::compress::compress_file(&path, &out, &opts, pr)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -914,6 +1347,8 @@ impl CompressState {
 pub struct ImagesState {
     images: Vec<PathBuf>,
     opts: ImageOptions,
+    /// Index of the image being dragged in the preview grid.
+    drag: Option<usize>,
 }
 
 const MAX_SIZES: [(u32, &str); 6] = [
@@ -931,7 +1366,7 @@ impl ImagesState {
             .extend(paths.into_iter().filter(|p| has_ext(p, IMG_EXT)));
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         ui.horizontal(|ui| {
             if ui.button(labeled(I_ADD, "Add images…")).clicked() {
                 self.add(pick_files("Images", IMG_EXT));
@@ -944,17 +1379,16 @@ impl ImagesState {
             }
         });
 
-        section(
-            ui,
-            &format!("Images · one per page ({})", self.images.len()),
-        );
         if self.images.is_empty() {
-            card(ui, |ui| {
-                ui.label(secondary(
-                    ui,
-                    "Add JPG, PNG, WEBP, GIF or BMP images, or drag them onto the window.",
-                ));
-            });
+            section(ui, "Images");
+            if drop_zone(
+                ui,
+                170.0,
+                "Drop images here or click to browse",
+                "JPG, PNG, WEBP, GIF or BMP · one image per page",
+            ) {
+                self.add(pick_files("Images", IMG_EXT));
+            }
         } else {
             let total: u64 = self
                 .images
@@ -962,32 +1396,25 @@ impl ImagesState {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            card(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        let mut i = 0;
-                        while i < self.images.len() {
-                            let removed = ui
-                                .horizontal(|ui| {
-                                    ui.label(secondary(ui, format!("{:>3}", i + 1)));
-                                    ui.label(RichText::new(I_PHOTO).size(15.0));
-                                    ui.label(file_name(&self.images[i]));
-                                    ui.label(secondary(ui, file_size(&self.images[i])).size(12.0));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| row_controls(ui, &mut self.images, i),
-                                    )
-                                    .inner
-                                })
-                                .inner;
-                            if !removed {
-                                i += 1;
-                            }
-                        }
-                    });
-                caption(ui, &format!("Total {}", pdf::human_size(total)));
-            });
+            section(ui, "Images");
+            setting(
+                ui,
+                I_PHOTO,
+                &format!("{} image(s), one per page", self.images.len()),
+                &format!(
+                    "{} in total · arrange them in the preview below",
+                    pdf::human_size(total)
+                ),
+                |_| {},
+            );
+            if drop_zone(
+                ui,
+                56.0,
+                "Add more images",
+                "Drop files here or click to browse",
+            ) {
+                self.add(pick_files("Images", IMG_EXT));
+            }
         }
 
         section(ui, "Image quality");
@@ -1079,8 +1506,22 @@ impl ImagesState {
             let (imgs, opts) = (self.images.clone(), self.opts.clone());
             return task(
                 format!("Optimising and converting {n} image(s)"),
-                move || pdf::images::images_to_pdf(&imgs, &opts, &out),
+                move |pr| pdf::images::images_to_pdf(&imgs, &opts, &out, pr),
             );
+        }
+        if !self.images.is_empty() {
+            section(ui, &format!("Order of pages ({})", self.images.len()));
+            preview::sortable_grid(ui, thumbs, &mut self.drag, &mut self.images, "image", |p| {
+                (
+                    ViewItem {
+                        path: p.clone(),
+                        page: 0,
+                        rotate: 0,
+                    },
+                    file_name(p),
+                    file_size(p),
+                )
+            });
         }
         None
     }
@@ -1097,6 +1538,22 @@ struct LinkDraft {
     page: u32,
 }
 
+/// The link selected in the editor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkSel {
+    Existing(usize),
+    Draft(usize),
+}
+
+/// What the mouse is doing on the page canvas.
+#[derive(Clone, Copy, Debug)]
+enum CanvasDrag {
+    /// Drawing a new link area from this corner (page points).
+    Draw(egui::Pos2),
+    /// Moving new link `i`; the vector is the pointer's offset from the box corner (points).
+    Move(usize, Vec2),
+}
+
 #[derive(Default)]
 pub struct LinksState {
     pub src: Source,
@@ -1104,6 +1561,24 @@ pub struct LinksState {
     existing: Vec<(ExistingLink, bool)>,
     drafts: Vec<LinkDraft>,
     error: Option<String>,
+    /// Page shown in the editor (1-based).
+    page: u32,
+    selected: Option<LinkSel>,
+    drag: Option<CanvasDrag>,
+    /// Put the cursor in the address field of a link that was just drawn.
+    focus_url: bool,
+    /// Scroll the page list to the current page (after Previous / Next).
+    scroll_list: bool,
+}
+
+const LINK_RED: Color32 = Color32::from_rgb(0xE8, 0x11, 0x23);
+
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
 }
 
 impl LinksState {
@@ -1112,6 +1587,9 @@ impl LinksState {
         self.drafts.clear();
         self.sizes.clear();
         self.error = None;
+        self.selected = None;
+        self.drag = None;
+        self.page = 1;
         if let Some(p) = &self.src.path {
             match pdf::links::scan(p) {
                 Ok(s) => {
@@ -1123,138 +1601,515 @@ impl LinksState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
-        section(ui, "Source");
-        if self.src.ui(ui) {
+    fn page_size(&self, page: u32) -> (f32, f32) {
+        self.sizes
+            .get(page.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or((595.0, 842.0))
+    }
+
+    fn go_to(&mut self, page: u32) {
+        if page != self.page {
+            self.page = page;
+            self.selected = None;
+            self.drag = None;
+        }
+    }
+
+    /// Topmost link under a point (page points) on the current page.
+    fn hit(&self, x: f32, y: f32) -> Option<LinkSel> {
+        let inside = |r: &LinkRect| {
+            r.page == self.page && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+        };
+        if let Some(i) = self.drafts.iter().rposition(|d| inside(&d.rect)) {
+            return Some(LinkSel::Draft(i));
+        }
+        self.existing
+            .iter()
+            .rposition(|(l, _)| inside(&l.rect))
+            .map(LinkSel::Existing)
+    }
+
+    fn target_text(d: &LinkDraft) -> String {
+        if d.to_page {
+            format!("→ page {}", d.page)
+        } else {
+            d.url.trim().to_string()
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
+        if self.src.ui(ui, thumbs) {
             self.load();
         }
         if let Some(e) = &self.error {
             ui.colored_label(Palette::current(ui).error, e);
         }
-        self.src.path.as_ref()?;
-
-        section(ui, &format!("Existing links ({})", self.existing.len()));
-        card(ui, |ui| {
-            if self.existing.is_empty() {
-                ui.label(secondary(ui, "This PDF has no links."));
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("existing")
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("ex_links")
-                        .striped(true)
-                        .num_columns(4)
-                        .spacing([16.0, 6.0])
-                        .show(ui, |ui| {
-                            for (l, remove) in &mut self.existing {
-                                ui.checkbox(remove, "Remove");
-                                ui.label(format!("Page {}", l.rect.page));
-                                ui.label(secondary(
-                                    ui,
-                                    format!(
-                                        "x {:.0}, y {:.0} · {:.0} × {:.0}",
-                                        l.rect.x, l.rect.y, l.rect.w, l.rect.h
-                                    ),
-                                ));
-                                ui.label(&l.target);
-                                ui.end_row();
-                            }
-                        });
-                });
-        });
-
-        let pages = self.src.pages.max(1);
-        section(ui, "New links");
-        if ui.button(labeled(I_ADD, "Add link")).clicked() {
-            let (w, _) = self.sizes.first().copied().unwrap_or((595.0, 842.0));
-            self.drafts.push(LinkDraft {
-                rect: LinkRect {
-                    page: 1,
-                    x: 36.0,
-                    y: 36.0,
-                    w: (w - 72.0).max(50.0),
-                    h: 40.0,
-                },
-                to_page: false,
-                url: "https://".into(),
-                page: 1,
-            });
+        let path = self.src.path.clone()?;
+        let pages = self.sizes.len() as u32;
+        if pages == 0 {
+            return None;
         }
-        let mut del = None;
-        for (i, d) in self.drafts.iter_mut().enumerate() {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(strong(format!("{}  Link {}", I_LINK, i + 1)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, true, I_DELETE, "Remove") {
-                            del = Some(i);
+        self.page = self.page.clamp(1, pages);
+
+        ui.add_space(8.0);
+        let height = (ui.available_height() - 4.0).max(320.0);
+        let mut action = None;
+        let column = egui::Layout::top_down(egui::Align::Min);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(132.0, height), column, |ui| {
+                self.page_list(ui, thumbs, &path, pages)
+            });
+            ui.add_space(6.0);
+            let side_w = 330.0;
+            let canvas_w = (ui.available_width() - side_w - 12.0).max(240.0);
+            ui.allocate_ui_with_layout(Vec2::new(canvas_w, height), column, |ui| {
+                self.canvas(ui, thumbs, &path, pages)
+            });
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(Vec2::new(side_w, height), column, |ui| {
+                action = self.side_panel(ui, &path, pages)
+            });
+        });
+        action
+    }
+
+    /// Left column: a thumbnail of every page with its link boxes.
+    fn page_list(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs, path: &Path, pages: u32) {
+        let p = Palette::current(ui);
+        let height = ui.available_height();
+        egui::Frame::new()
+            .fill(if p.dark {
+                Color32::from_rgb(0x1C, 0x1C, 0x1C)
+            } else {
+                Color32::from_rgb(0xEB, 0xEB, 0xEB)
+            })
+            .corner_radius(8.0)
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.set_height(height - 12.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("link_pages")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for n in 1..=pages {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 150.0),
+                                Sense::click(),
+                            );
+                            let current = n == self.page;
+                            if current {
+                                ui.painter()
+                                    .rect_filled(rect, 6.0, p.accent.gamma_multiply(0.18));
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    6.0,
+                                    Stroke::new(2.0, p.accent),
+                                    StrokeKind::Inside,
+                                );
+                                if self.scroll_list {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                    self.scroll_list = false;
+                                }
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(rect, 6.0, p.card_hover);
+                            }
+                            let area = Rect::from_min_max(
+                                rect.min + Vec2::new(8.0, 8.0),
+                                rect.max - Vec2::new(8.0, 24.0),
+                            );
+                            let shown = thumbs.paint_page(ui, path, n, THUMB, 0, area);
+                            let (pw, ph) = self.page_size(n);
+                            let map = |r: &LinkRect| {
+                                Rect::from_min_size(
+                                    shown.min
+                                        + Vec2::new(
+                                            r.x / pw * shown.width(),
+                                            r.y / ph * shown.height(),
+                                        ),
+                                    Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
+                                )
+                            };
+                            let mut count = 0;
+                            for (l, removed) in
+                                self.existing.iter().filter(|(l, _)| l.rect.page == n)
+                            {
+                                let c = if *removed {
+                                    LINK_RED.gamma_multiply(0.3)
+                                } else {
+                                    LINK_RED
+                                };
+                                ui.painter().rect_stroke(
+                                    map(&l.rect),
+                                    0.0,
+                                    Stroke::new(1.0, c),
+                                    StrokeKind::Inside,
+                                );
+                                count += usize::from(!removed);
+                            }
+                            for d in self.drafts.iter().filter(|d| d.rect.page == n) {
+                                ui.painter().rect(
+                                    map(&d.rect),
+                                    0.0,
+                                    p.accent.gamma_multiply(0.3),
+                                    Stroke::new(1.0, p.accent),
+                                    StrokeKind::Inside,
+                                );
+                                count += 1;
+                            }
+                            ui.painter().text(
+                                rect.center_bottom() - Vec2::new(0.0, 5.0),
+                                Align2::CENTER_BOTTOM,
+                                n.to_string(),
+                                FontId::proportional(12.0),
+                                if current { p.accent } else { p.text2 },
+                            );
+                            if count > 0 {
+                                let c = rect.right_top() + Vec2::new(-14.0, 14.0);
+                                ui.painter().circle_filled(c, 10.0, p.accent);
+                                ui.painter().text(
+                                    c,
+                                    Align2::CENTER_CENTER,
+                                    count.to_string(),
+                                    FontId::new(11.0, semibold()),
+                                    p.on_accent,
+                                );
+                            }
+                            if resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.go_to(n);
+                            }
                         }
                     });
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.to_page, false, "Web address");
-                    ui.radio_value(&mut d.to_page, true, "Go to page");
-                    if d.to_page {
-                        ui.add(egui::DragValue::new(&mut d.page).range(1..=pages));
-                    } else {
-                        ui.add(egui::TextEdit::singleline(&mut d.url).desired_width(360.0));
+            });
+    }
+
+    /// Centre: the page, large, where link areas are drawn and selected.
+    fn canvas(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs, path: &Path, pages: u32) {
+        let p = Palette::current(ui);
+        ui.horizontal(|ui| {
+            if icon_button(ui, self.page > 1, I_LEFT, "Previous page") {
+                let n = self.page - 1;
+                self.go_to(n);
+                self.scroll_list = true;
+            }
+            ui.label(strong(format!("Page {} of {}", self.page, pages)));
+            if icon_button(ui, self.page < pages, I_RIGHT, "Next page") {
+                let n = self.page + 1;
+                self.go_to(n);
+                self.scroll_list = true;
+            }
+            ui.add_space(12.0);
+            caption(ui, "Drag on the page to draw a link area · click a box to select it · drag a new box to move it");
+        });
+        ui.add_space(4.0);
+
+        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        ui.painter().rect_filled(
+            area,
+            8.0,
+            if p.dark {
+                Color32::from_rgb(0x1C, 0x1C, 0x1C)
+            } else {
+                Color32::from_rgb(0xEB, 0xEB, 0xEB)
+            },
+        );
+        let shown = thumbs.paint_page(ui, path, self.page, LARGE, 0, area.shrink(18.0));
+        let (pw, ph) = self.page_size(self.page);
+        let to_screen = |r: &LinkRect| {
+            Rect::from_min_size(
+                shown.min + Vec2::new(r.x / pw * shown.width(), r.y / ph * shown.height()),
+                Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
+            )
+        };
+        let to_pts = |pos: egui::Pos2| {
+            egui::pos2(
+                ((pos.x - shown.left()) / shown.width() * pw).clamp(0.0, pw),
+                ((pos.y - shown.top()) / shown.height() * ph).clamp(0.0, ph),
+            )
+        };
+
+        let resp = ui.interact(
+            shown,
+            ui.make_persistent_id("link_canvas"),
+            Sense::click_and_drag(),
+        );
+        let pointer = resp.interact_pointer_pos();
+
+        if resp.drag_started()
+            && let Some(pos) = pointer
+        {
+            let pt = to_pts(pos);
+            match self.hit(pt.x, pt.y) {
+                Some(LinkSel::Draft(i)) => {
+                    self.selected = Some(LinkSel::Draft(i));
+                    let r = &self.drafts[i].rect;
+                    self.drag = Some(CanvasDrag::Move(i, Vec2::new(pt.x - r.x, pt.y - r.y)));
+                }
+                _ => {
+                    self.selected = None;
+                    self.drag = Some(CanvasDrag::Draw(pt));
+                }
+            }
+        }
+
+        let mut rubber = None;
+        if let (Some(d), Some(pos)) = (self.drag, pointer) {
+            let pt = to_pts(pos);
+            match d {
+                CanvasDrag::Draw(start) => rubber = Some(Rect::from_two_pos(start, pt)),
+                CanvasDrag::Move(i, grab) => {
+                    if let Some(dr) = self.drafts.get_mut(i) {
+                        dr.rect.x = (pt.x - grab.x).clamp(0.0, (pw - dr.rect.w).max(0.0));
+                        dr.rect.y = (pt.y - grab.y).clamp(0.0, (ph - dr.rect.h).max(0.0));
                     }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(r) = rubber
+                && r.width() >= 4.0
+                && r.height() >= 4.0
+            {
+                self.drafts.push(LinkDraft {
+                    rect: LinkRect {
+                        page: self.page,
+                        x: r.min.x,
+                        y: r.min.y,
+                        w: r.width(),
+                        h: r.height(),
+                    },
+                    to_page: false,
+                    url: "https://".into(),
+                    page: 1,
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("On page");
-                    ui.add(egui::DragValue::new(&mut d.rect.page).range(1..=pages));
-                    let (pw, ph) = self
-                        .sizes
-                        .get(d.rect.page as usize - 1)
-                        .copied()
-                        .unwrap_or((595.0, 842.0));
-                    ui.add_space(8.0);
-                    ui.label("x");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.x)
-                            .range(0.0..=pw)
-                            .speed(1.0),
-                    );
-                    ui.label("y");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.y)
-                            .range(0.0..=ph)
-                            .speed(1.0),
-                    );
-                    ui.label("width");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.w)
-                            .range(1.0..=pw)
-                            .speed(1.0),
-                    );
-                    ui.label("height");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.h)
-                            .range(1.0..=ph)
-                            .speed(1.0),
-                    );
-                    if ui.small_button("Whole page").clicked() {
-                        d.rect = LinkRect {
-                            page: d.rect.page,
-                            x: 0.0,
-                            y: 0.0,
-                            w: pw,
-                            h: ph,
-                        };
-                    }
-                    caption(ui, &format!("Page is {pw:.0} × {ph:.0} pt"));
-                });
+                self.selected = Some(LinkSel::Draft(self.drafts.len() - 1));
+                self.focus_url = true;
+            }
+            self.drag = None;
+        }
+        if resp.clicked() {
+            self.selected = pointer.and_then(|pos| {
+                let pt = to_pts(pos);
+                self.hit(pt.x, pt.y)
             });
         }
-        if let Some(i) = del {
-            self.drafts.remove(i);
+        if let Some(pos) = resp.hover_pos() {
+            let pt = to_pts(pos);
+            let icon = match self.hit(pt.x, pt.y) {
+                Some(LinkSel::Draft(_)) => egui::CursorIcon::Move,
+                Some(LinkSel::Existing(_)) => egui::CursorIcon::PointingHand,
+                None => egui::CursorIcon::Crosshair,
+            };
+            ui.ctx().set_cursor_icon(icon);
         }
-        caption(
-            ui,
-            "Positions are in points (1/72 inch), measured from the top-left corner of the page as displayed.",
-        );
 
+        // Link boxes.
+        let painter = ui.painter().with_clip_rect(area);
+        for (i, (l, removed)) in self
+            .existing
+            .iter()
+            .enumerate()
+            .filter(|(_, (l, _))| l.rect.page == self.page)
+        {
+            let r = to_screen(&l.rect);
+            let selected = self.selected == Some(LinkSel::Existing(i));
+            let c = if *removed {
+                LINK_RED.gamma_multiply(0.35)
+            } else {
+                LINK_RED
+            };
+            painter.rect(
+                r,
+                2.0,
+                c.gamma_multiply(0.12),
+                Stroke::new(if selected { 3.0 } else { 1.5 }, c),
+                StrokeKind::Outside,
+            );
+            if *removed {
+                painter.line_segment([r.left_top(), r.right_bottom()], Stroke::new(1.5, c));
+                painter.line_segment([r.right_top(), r.left_bottom()], Stroke::new(1.5, c));
+            }
+        }
+        for (i, d) in self
+            .drafts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.rect.page == self.page)
+        {
+            let r = to_screen(&d.rect);
+            let selected = self.selected == Some(LinkSel::Draft(i));
+            painter.rect(
+                r,
+                2.0,
+                p.accent.gamma_multiply(0.22),
+                Stroke::new(if selected { 3.0 } else { 1.5 }, p.accent),
+                StrokeKind::Outside,
+            );
+            if selected {
+                let label = shorten(&Self::target_text(d), 40);
+                let galley = painter.layout_no_wrap(
+                    format!("{I_LINK}  {label}"),
+                    FontId::proportional(12.0),
+                    p.on_accent,
+                );
+                let tag = Rect::from_min_size(
+                    r.left_top() - Vec2::new(0.0, galley.size().y + 8.0),
+                    galley.size() + Vec2::new(12.0, 6.0),
+                );
+                painter.rect_filled(tag, 4.0, p.accent);
+                painter.galley(tag.min + Vec2::new(6.0, 3.0), galley, p.on_accent);
+            }
+        }
+        if let Some(r) = rubber {
+            let r = to_screen(&LinkRect {
+                page: self.page,
+                x: r.min.x,
+                y: r.min.y,
+                w: r.width(),
+                h: r.height(),
+            });
+            painter.rect(
+                r,
+                2.0,
+                p.accent.gamma_multiply(0.15),
+                Stroke::new(2.0, p.accent),
+                StrokeKind::Outside,
+            );
+        }
+    }
+
+    /// Right column: the selected link, the links on this page and Save.
+    fn side_panel(&mut self, ui: &mut egui::Ui, path: &Path, pages: u32) -> Option<Task> {
+        let p = Palette::current(ui);
+        let height = ui.available_height();
+        let mut action = None;
+        egui::Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(8.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_height(height - 34.0);
+                egui::ScrollArea::vertical().id_salt("link_side").auto_shrink([false, false]).show(ui, |ui| {
+                    // --- Selected link ---
+                    match self.selected {
+                        Some(LinkSel::Draft(i)) if i < self.drafts.len() => {
+                            ui.label(strong(format!("{I_LINK}  New link")).size(15.0));
+                            ui.add_space(6.0);
+                            let (pw, ph) = self.page_size(self.drafts[i].rect.page);
+                            let d = &mut self.drafts[i];
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut d.to_page, false, "Web address");
+                                ui.radio_value(&mut d.to_page, true, "Go to page");
+                            });
+                            if d.to_page {
+                                ui.horizontal(|ui| {
+                                    ui.label("Page");
+                                    ui.add(egui::DragValue::new(&mut d.page).range(1..=pages));
+                                });
+                            } else {
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(&mut d.url)
+                                        .hint_text("https://example.com")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if self.focus_url {
+                                    edit.request_focus();
+                                    self.focus_url = false;
+                                }
+                            }
+                            ui.add_space(8.0);
+                            caption(ui, "Position on the page (points, from the top-left):");
+                            egui::Grid::new("link_pos").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                                ui.label("x");
+                                ui.add(egui::DragValue::new(&mut d.rect.x).range(0.0..=pw).speed(1.0));
+                                ui.label("y");
+                                ui.add(egui::DragValue::new(&mut d.rect.y).range(0.0..=ph).speed(1.0));
+                                ui.end_row();
+                                ui.label("width");
+                                ui.add(egui::DragValue::new(&mut d.rect.w).range(1.0..=pw).speed(1.0));
+                                ui.label("height");
+                                ui.add(egui::DragValue::new(&mut d.rect.h).range(1.0..=ph).speed(1.0));
+                                ui.end_row();
+                            });
+                            ui.add_space(8.0);
+                            let mut delete = false;
+                            ui.horizontal(|ui| {
+                                if ui.button("Whole page").clicked() {
+                                    d.rect = LinkRect { page: d.rect.page, x: 0.0, y: 0.0, w: pw, h: ph };
+                                }
+                                delete = ui.button(labeled(I_DELETE, "Delete")).clicked();
+                            });
+                            if delete {
+                                self.drafts.remove(i);
+                                self.selected = None;
+                            }
+                        }
+                        Some(LinkSel::Existing(i)) if i < self.existing.len() => {
+                            ui.label(strong(format!("{I_LINK}  Existing link")).size(15.0));
+                            ui.add_space(6.0);
+                            let (l, removed) = &mut self.existing[i];
+                            ui.add(egui::Label::new(l.target.clone()).wrap());
+                            caption(ui, &format!("x {:.0}, y {:.0} · {:.0} × {:.0} pt", l.rect.x, l.rect.y, l.rect.w, l.rect.h));
+                            ui.add_space(8.0);
+                            let text = if *removed { labeled(I_ADD, "Keep this link") } else { labeled(I_DELETE, "Remove this link") };
+                            if ui.button(text).clicked() {
+                                *removed = !*removed;
+                            }
+                            if *removed {
+                                ui.colored_label(p.error, "Will be removed when you save.");
+                            }
+                        }
+                        _ => {
+                            ui.label(strong("Add a link").size(15.0));
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(secondary(
+                                    ui,
+                                    "Drag on the page to draw the clickable area, then type the web address \
+                                     or choose a page to jump to. Click any box to select it.",
+                                ))
+                                .wrap(),
+                            );
+                        }
+                    }
+
+                    // --- Links on this page ---
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(strong(format!("Links on page {}", self.page)));
+                    let mut clicked = None;
+                    let mut any = false;
+                    for (i, (l, removed)) in self.existing.iter().enumerate().filter(|(_, (l, _))| l.rect.page == self.page) {
+                        any = true;
+                        let text = RichText::new(format!("●  {}", shorten(&l.target, 34)))
+                            .color(if *removed { p.text2 } else { p.text });
+                        let text = if *removed { text.strikethrough() } else { text };
+                        if ui.selectable_label(self.selected == Some(LinkSel::Existing(i)), text).clicked() {
+                            clicked = Some(LinkSel::Existing(i));
+                        }
+                    }
+                    for (i, d) in self.drafts.iter().enumerate().filter(|(_, d)| d.rect.page == self.page) {
+                        any = true;
+                        let text = RichText::new(format!("+  {}", shorten(&Self::target_text(d), 34))).color(p.accent);
+                        if ui.selectable_label(self.selected == Some(LinkSel::Draft(i)), text).clicked() {
+                            clicked = Some(LinkSel::Draft(i));
+                        }
+                    }
+                    if !any {
+                        caption(ui, "No links on this page yet.");
+                    }
+                    if clicked.is_some() {
+                        self.selected = clicked;
+                    }
+                });
+            });
+
+        // --- Save ---
         let removing: Vec<(u32, usize)> = self
             .existing
             .iter()
@@ -1262,26 +2117,38 @@ impl LinksState {
             .map(|(l, _)| (l.rect.page, l.index))
             .collect();
         let changes = removing.len() + self.drafts.len();
-        let path = self.src.path.clone()?;
-        if footer(ui, changes > 0, &labeled(I_SAVE, "Save links")) {
-            let out = save_as(Some(&path), "links", "pdf")?;
-            let add: Vec<NewLink> = self
-                .drafts
-                .iter()
-                .map(|d| NewLink {
-                    rect: d.rect.clone(),
-                    target: if d.to_page {
-                        LinkTarget::Page(d.page)
-                    } else {
-                        LinkTarget::Url(d.url.clone())
-                    },
-                })
-                .collect();
-            return task("Saving links", move || {
-                pdf::links::apply(&path, &out, &removing, &add)
-            });
-        }
-        None
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let label = labeled(
+                I_SAVE,
+                &format!(
+                    "Save ({} new, {} removed)",
+                    self.drafts.len(),
+                    removing.len()
+                ),
+            );
+            if accent_button(ui, changes > 0, &label)
+                && let Some(out) = save_as(Some(path), "links", "pdf")
+            {
+                let add: Vec<NewLink> = self
+                    .drafts
+                    .iter()
+                    .map(|d| NewLink {
+                        rect: d.rect.clone(),
+                        target: if d.to_page {
+                            LinkTarget::Page(d.page)
+                        } else {
+                            LinkTarget::Url(d.url.clone())
+                        },
+                    })
+                    .collect();
+                let path = path.to_path_buf();
+                action = task("Saving links", move |pr| {
+                    pdf::links::apply(&path, &out, &removing, &add, pr)
+                });
+            }
+        });
+        action
     }
 }
 
@@ -1312,9 +2179,9 @@ impl MetaState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        if self.src.ui(ui) {
+        if self.src.ui(ui, thumbs) {
             self.load();
         }
         if let Some(e) = &self.error {
@@ -1373,10 +2240,11 @@ impl MetaState {
         ) {
             let out = save_as(Some(&path), "edited", "pdf")?;
             let fields = self.fields.clone();
-            return task("Saving properties", move || {
-                pdf::meta::write_info(&path, &out, &fields)
+            return task("Saving properties", move |pr| {
+                pdf::meta::write_info(&path, &out, &fields, pr)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -1392,9 +2260,9 @@ pub struct TextState {
 }
 
 impl TextState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
         section(ui, "Options");
         setting(ui, I_DOCUMENT, "Pages", "Examples: 1-3, 5, 8-end", |ui| {
             pages_field(ui, &mut self.range, 180.0);
@@ -1407,10 +2275,14 @@ impl TextState {
         if footer(ui, true, &labeled(I_SAVE, "Extract to .txt")) {
             let out = save_as(Some(&path), "text", "txt")?;
             let range = self.range.clone();
-            return task("Extracting text", move || {
-                pdf::meta::extract_text(&path, &out, &range)
+            return task("Extracting text", move |pr| {
+                pdf::meta::extract_text(&path, &out, &range, pr)
             });
         }
+        let sel = selected_pages(&self.range, self.src.pages);
+        self.src.preview(ui, thumbs, |p| {
+            sel.as_ref().is_some_and(|s| !s.contains(&p))
+        });
         None
     }
 }
@@ -1429,9 +2301,9 @@ pub struct ProtectState {
 }
 
 impl ProtectState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
 
         section(ui, "Passwords");
         card(ui, |ui| {
@@ -1503,10 +2375,11 @@ impl ProtectState {
         if footer(ui, ok, &labeled(I_LOCK, "Protect & save")) {
             let out = save_as(Some(&path), "protected", "pdf")?;
             let (u, o, a) = (self.user.clone(), self.owner.clone(), self.allow);
-            return task("Encrypting", move || {
-                pdf::meta::protect(&path, &out, &u, &o, a)
+            return task("Encrypting", move |pr| {
+                pdf::meta::protect(&path, &out, &u, &o, a, pr)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -1518,8 +2391,20 @@ pub struct UnlockState {
 }
 
 impl UnlockState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
+        if self.path.is_none() {
+            if drop_zone(
+                ui,
+                170.0,
+                "Drop a protected PDF here or click to browse",
+                "The file you want to remove the password from",
+            ) && let Some(p) = pick_file("PDF", PDF_EXT)
+            {
+                self.path = Some(p);
+            }
+            return None;
+        }
         let (name, info) = match &self.path {
             Some(p) => (file_name(p), file_size(p)),
             None => ("No file selected".into(), "Choose a protected PDF".into()),
@@ -1549,7 +2434,9 @@ impl UnlockState {
         if footer(ui, true, &labeled(I_UNLOCK, "Unlock & save")) {
             let out = save_as(Some(&path), "unlocked", "pdf")?;
             let pw = self.password.clone();
-            return task("Unlocking", move || pdf::meta::unlock(&path, &out, &pw));
+            return task("Unlocking", move |pr| {
+                pdf::meta::unlock(&path, &out, &pw, pr)
+            });
         }
         None
     }
