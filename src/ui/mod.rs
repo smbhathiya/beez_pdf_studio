@@ -305,7 +305,7 @@ impl App {
         // Tools are disabled while a task runs or while an update is being installed.
         let busy = self.running.is_some() || self.update.busy();
         ui.add_enabled_ui(!busy, |ui| {
-            if tool == Tool::Organize {
+            if matches!(tool, Tool::Organize | Tool::Links) {
                 // The organizer fills the window and scrolls its own page grid.
                 body(self, ui)
             } else {

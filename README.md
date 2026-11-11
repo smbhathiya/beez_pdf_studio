@@ -47,7 +47,7 @@ Every PDF tool shows real thumbnails of all pages, rendered in the app with [hay
 - **Merge:** a strip of pages under each file. Pages outside the page selection are faded. Drag a file by its **☰ handle** to change the merge order, or onto the delete zone to remove it.
 - **Images to PDF:** a thumbnail grid of the images in page order. Drag to reorder, drop on the delete zone (or click **×**) to remove, and click an image to view it large.
 - **Split & Extract:** each page shows which output file it goes to (`File 1`, `File 2`…), and extracted pages are highlighted.
-- **Link Editor:** existing links (red) and new links (blue) are drawn on the pages.
+- **Link Editor:** a visual editor. Pick a page in the list on the left, **drag on the large page to draw a link area**, then type the web address (or choose a page to jump to) in the panel on the right. Existing links show in red (click one to remove it) and new links in blue (drag a new box to move it).
 - **Compress, Extract Text, Properties, Protect:** a grid of every page.
 - **Page viewer:** click any page to open it large. Use ← / → for previous and next, + / − to zoom, and Esc to close.
 

@@ -303,11 +303,15 @@ impl Thumbs {
                 });
                 ui.add_space(8.0);
                 let view_h = size.y - 56.0;
+                // Reserve the full viewer area: inside a pop-up the scroll area would
+                // otherwise shrink and cut the page off.
                 egui::ScrollArea::both()
+                    .min_scrolled_height(view_h)
                     .max_height(view_h)
+                    .min_scrolled_width(size.x)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let avail = Vec2::new(ui.available_width(), view_h - 8.0);
+                        let avail = Vec2::new(size.x - 12.0, view_h - 12.0);
                         let canvas = Vec2::new(avail.x * zoom.max(1.0), avail.y * zoom);
                         let (rect, _) = ui.allocate_exact_size(canvas, Sense::hover());
                         self.paint_page(ui, &item.path, item.page, LARGE, item.rotate, rect);

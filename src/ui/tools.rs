@@ -9,7 +9,8 @@ use eframe::egui::{
 };
 
 use super::preview::{
-    self, THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header, selected_pages,
+    self, LARGE, THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header,
+    selected_pages,
 };
 use super::theme::*;
 use crate::pdf::{
@@ -1498,6 +1499,22 @@ struct LinkDraft {
     page: u32,
 }
 
+/// The link selected in the editor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkSel {
+    Existing(usize),
+    Draft(usize),
+}
+
+/// What the mouse is doing on the page canvas.
+#[derive(Clone, Copy, Debug)]
+enum CanvasDrag {
+    /// Drawing a new link area from this corner (page points).
+    Draw(egui::Pos2),
+    /// Moving new link `i`; the vector is the pointer's offset from the box corner (points).
+    Move(usize, Vec2),
+}
+
 #[derive(Default)]
 pub struct LinksState {
     pub src: Source,
@@ -1505,6 +1522,24 @@ pub struct LinksState {
     existing: Vec<(ExistingLink, bool)>,
     drafts: Vec<LinkDraft>,
     error: Option<String>,
+    /// Page shown in the editor (1-based).
+    page: u32,
+    selected: Option<LinkSel>,
+    drag: Option<CanvasDrag>,
+    /// Put the cursor in the address field of a link that was just drawn.
+    focus_url: bool,
+    /// Scroll the page list to the current page (after Previous / Next).
+    scroll_list: bool,
+}
+
+const LINK_RED: Color32 = Color32::from_rgb(0xE8, 0x11, 0x23);
+
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
 }
 
 impl LinksState {
@@ -1513,6 +1548,9 @@ impl LinksState {
         self.drafts.clear();
         self.sizes.clear();
         self.error = None;
+        self.selected = None;
+        self.drag = None;
+        self.page = 1;
         if let Some(p) = &self.src.path {
             match pdf::links::scan(p) {
                 Ok(s) => {
@@ -1524,138 +1562,514 @@ impl LinksState {
         }
     }
 
+    fn page_size(&self, page: u32) -> (f32, f32) {
+        self.sizes
+            .get(page.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or((595.0, 842.0))
+    }
+
+    fn go_to(&mut self, page: u32) {
+        if page != self.page {
+            self.page = page;
+            self.selected = None;
+            self.drag = None;
+        }
+    }
+
+    /// Topmost link under a point (page points) on the current page.
+    fn hit(&self, x: f32, y: f32) -> Option<LinkSel> {
+        let inside = |r: &LinkRect| {
+            r.page == self.page && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+        };
+        if let Some(i) = self.drafts.iter().rposition(|d| inside(&d.rect)) {
+            return Some(LinkSel::Draft(i));
+        }
+        self.existing
+            .iter()
+            .rposition(|(l, _)| inside(&l.rect))
+            .map(LinkSel::Existing)
+    }
+
+    fn target_text(d: &LinkDraft) -> String {
+        if d.to_page {
+            format!("→ page {}", d.page)
+        } else {
+            d.url.trim().to_string()
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
-        section(ui, "Source");
         if self.src.ui(ui, thumbs) {
             self.load();
         }
         if let Some(e) = &self.error {
             ui.colored_label(Palette::current(ui).error, e);
         }
-        self.src.path.as_ref()?;
-
-        section(ui, &format!("Existing links ({})", self.existing.len()));
-        card(ui, |ui| {
-            if self.existing.is_empty() {
-                ui.label(secondary(ui, "This PDF has no links."));
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("existing")
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("ex_links")
-                        .striped(true)
-                        .num_columns(4)
-                        .spacing([16.0, 6.0])
-                        .show(ui, |ui| {
-                            for (l, remove) in &mut self.existing {
-                                ui.checkbox(remove, "Remove");
-                                ui.label(format!("Page {}", l.rect.page));
-                                ui.label(secondary(
-                                    ui,
-                                    format!(
-                                        "x {:.0}, y {:.0} · {:.0} × {:.0}",
-                                        l.rect.x, l.rect.y, l.rect.w, l.rect.h
-                                    ),
-                                ));
-                                ui.label(&l.target);
-                                ui.end_row();
-                            }
-                        });
-                });
-        });
-
-        let pages = self.src.pages.max(1);
-        section(ui, "New links");
-        if ui.button(labeled(I_ADD, "Add link")).clicked() {
-            let (w, _) = self.sizes.first().copied().unwrap_or((595.0, 842.0));
-            self.drafts.push(LinkDraft {
-                rect: LinkRect {
-                    page: 1,
-                    x: 36.0,
-                    y: 36.0,
-                    w: (w - 72.0).max(50.0),
-                    h: 40.0,
-                },
-                to_page: false,
-                url: "https://".into(),
-                page: 1,
-            });
+        let path = self.src.path.clone()?;
+        let pages = self.sizes.len() as u32;
+        if pages == 0 {
+            return None;
         }
-        let mut del = None;
-        for (i, d) in self.drafts.iter_mut().enumerate() {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(strong(format!("{}  Link {}", I_LINK, i + 1)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, true, I_DELETE, "Remove") {
-                            del = Some(i);
+        self.page = self.page.clamp(1, pages);
+
+        ui.add_space(8.0);
+        let height = (ui.available_height() - 4.0).max(320.0);
+        let mut action = None;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui(Vec2::new(132.0, height), |ui| {
+                self.page_list(ui, thumbs, &path, pages)
+            });
+            ui.add_space(6.0);
+            let side_w = 330.0;
+            let canvas_w = (ui.available_width() - side_w - 12.0).max(240.0);
+            ui.allocate_ui(Vec2::new(canvas_w, height), |ui| {
+                self.canvas(ui, thumbs, &path, pages)
+            });
+            ui.add_space(6.0);
+            ui.allocate_ui(Vec2::new(side_w, height), |ui| {
+                action = self.side_panel(ui, &path, pages)
+            });
+        });
+        action
+    }
+
+    /// Left column: a thumbnail of every page with its link boxes.
+    fn page_list(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs, path: &Path, pages: u32) {
+        let p = Palette::current(ui);
+        let height = ui.available_height();
+        egui::Frame::new()
+            .fill(if p.dark {
+                Color32::from_rgb(0x1C, 0x1C, 0x1C)
+            } else {
+                Color32::from_rgb(0xEB, 0xEB, 0xEB)
+            })
+            .corner_radius(8.0)
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.set_height(height - 12.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("link_pages")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for n in 1..=pages {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 150.0),
+                                Sense::click(),
+                            );
+                            let current = n == self.page;
+                            if current {
+                                ui.painter()
+                                    .rect_filled(rect, 6.0, p.accent.gamma_multiply(0.18));
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    6.0,
+                                    Stroke::new(2.0, p.accent),
+                                    StrokeKind::Inside,
+                                );
+                                if self.scroll_list {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                    self.scroll_list = false;
+                                }
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(rect, 6.0, p.card_hover);
+                            }
+                            let area = Rect::from_min_max(
+                                rect.min + Vec2::new(8.0, 8.0),
+                                rect.max - Vec2::new(8.0, 24.0),
+                            );
+                            let shown = thumbs.paint_page(ui, path, n, THUMB, 0, area);
+                            let (pw, ph) = self.page_size(n);
+                            let map = |r: &LinkRect| {
+                                Rect::from_min_size(
+                                    shown.min
+                                        + Vec2::new(
+                                            r.x / pw * shown.width(),
+                                            r.y / ph * shown.height(),
+                                        ),
+                                    Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
+                                )
+                            };
+                            let mut count = 0;
+                            for (l, removed) in
+                                self.existing.iter().filter(|(l, _)| l.rect.page == n)
+                            {
+                                let c = if *removed {
+                                    LINK_RED.gamma_multiply(0.3)
+                                } else {
+                                    LINK_RED
+                                };
+                                ui.painter().rect_stroke(
+                                    map(&l.rect),
+                                    0.0,
+                                    Stroke::new(1.0, c),
+                                    StrokeKind::Inside,
+                                );
+                                count += usize::from(!removed);
+                            }
+                            for d in self.drafts.iter().filter(|d| d.rect.page == n) {
+                                ui.painter().rect(
+                                    map(&d.rect),
+                                    0.0,
+                                    p.accent.gamma_multiply(0.3),
+                                    Stroke::new(1.0, p.accent),
+                                    StrokeKind::Inside,
+                                );
+                                count += 1;
+                            }
+                            ui.painter().text(
+                                rect.center_bottom() - Vec2::new(0.0, 5.0),
+                                Align2::CENTER_BOTTOM,
+                                n.to_string(),
+                                FontId::proportional(12.0),
+                                if current { p.accent } else { p.text2 },
+                            );
+                            if count > 0 {
+                                let c = rect.right_top() + Vec2::new(-14.0, 14.0);
+                                ui.painter().circle_filled(c, 10.0, p.accent);
+                                ui.painter().text(
+                                    c,
+                                    Align2::CENTER_CENTER,
+                                    count.to_string(),
+                                    FontId::new(11.0, semibold()),
+                                    p.on_accent,
+                                );
+                            }
+                            if resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.go_to(n);
+                            }
                         }
                     });
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.to_page, false, "Web address");
-                    ui.radio_value(&mut d.to_page, true, "Go to page");
-                    if d.to_page {
-                        ui.add(egui::DragValue::new(&mut d.page).range(1..=pages));
-                    } else {
-                        ui.add(egui::TextEdit::singleline(&mut d.url).desired_width(360.0));
+            });
+    }
+
+    /// Centre: the page, large, where link areas are drawn and selected.
+    fn canvas(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs, path: &Path, pages: u32) {
+        let p = Palette::current(ui);
+        ui.horizontal(|ui| {
+            if icon_button(ui, self.page > 1, I_LEFT, "Previous page") {
+                let n = self.page - 1;
+                self.go_to(n);
+                self.scroll_list = true;
+            }
+            ui.label(strong(format!("Page {} of {}", self.page, pages)));
+            if icon_button(ui, self.page < pages, I_RIGHT, "Next page") {
+                let n = self.page + 1;
+                self.go_to(n);
+                self.scroll_list = true;
+            }
+            ui.add_space(12.0);
+            caption(ui, "Drag on the page to draw a link area · click a box to select it · drag a new box to move it");
+        });
+        ui.add_space(4.0);
+
+        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        ui.painter().rect_filled(
+            area,
+            8.0,
+            if p.dark {
+                Color32::from_rgb(0x1C, 0x1C, 0x1C)
+            } else {
+                Color32::from_rgb(0xEB, 0xEB, 0xEB)
+            },
+        );
+        let shown = thumbs.paint_page(ui, path, self.page, LARGE, 0, area.shrink(18.0));
+        let (pw, ph) = self.page_size(self.page);
+        let to_screen = |r: &LinkRect| {
+            Rect::from_min_size(
+                shown.min + Vec2::new(r.x / pw * shown.width(), r.y / ph * shown.height()),
+                Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
+            )
+        };
+        let to_pts = |pos: egui::Pos2| {
+            egui::pos2(
+                ((pos.x - shown.left()) / shown.width() * pw).clamp(0.0, pw),
+                ((pos.y - shown.top()) / shown.height() * ph).clamp(0.0, ph),
+            )
+        };
+
+        let resp = ui.interact(
+            shown,
+            ui.make_persistent_id("link_canvas"),
+            Sense::click_and_drag(),
+        );
+        let pointer = resp.interact_pointer_pos();
+
+        if resp.drag_started()
+            && let Some(pos) = pointer
+        {
+            let pt = to_pts(pos);
+            match self.hit(pt.x, pt.y) {
+                Some(LinkSel::Draft(i)) => {
+                    self.selected = Some(LinkSel::Draft(i));
+                    let r = &self.drafts[i].rect;
+                    self.drag = Some(CanvasDrag::Move(i, Vec2::new(pt.x - r.x, pt.y - r.y)));
+                }
+                _ => {
+                    self.selected = None;
+                    self.drag = Some(CanvasDrag::Draw(pt));
+                }
+            }
+        }
+
+        let mut rubber = None;
+        if let (Some(d), Some(pos)) = (self.drag, pointer) {
+            let pt = to_pts(pos);
+            match d {
+                CanvasDrag::Draw(start) => rubber = Some(Rect::from_two_pos(start, pt)),
+                CanvasDrag::Move(i, grab) => {
+                    if let Some(dr) = self.drafts.get_mut(i) {
+                        dr.rect.x = (pt.x - grab.x).clamp(0.0, (pw - dr.rect.w).max(0.0));
+                        dr.rect.y = (pt.y - grab.y).clamp(0.0, (ph - dr.rect.h).max(0.0));
                     }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(r) = rubber
+                && r.width() >= 4.0
+                && r.height() >= 4.0
+            {
+                self.drafts.push(LinkDraft {
+                    rect: LinkRect {
+                        page: self.page,
+                        x: r.min.x,
+                        y: r.min.y,
+                        w: r.width(),
+                        h: r.height(),
+                    },
+                    to_page: false,
+                    url: "https://".into(),
+                    page: 1,
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("On page");
-                    ui.add(egui::DragValue::new(&mut d.rect.page).range(1..=pages));
-                    let (pw, ph) = self
-                        .sizes
-                        .get(d.rect.page as usize - 1)
-                        .copied()
-                        .unwrap_or((595.0, 842.0));
-                    ui.add_space(8.0);
-                    ui.label("x");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.x)
-                            .range(0.0..=pw)
-                            .speed(1.0),
-                    );
-                    ui.label("y");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.y)
-                            .range(0.0..=ph)
-                            .speed(1.0),
-                    );
-                    ui.label("width");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.w)
-                            .range(1.0..=pw)
-                            .speed(1.0),
-                    );
-                    ui.label("height");
-                    ui.add(
-                        egui::DragValue::new(&mut d.rect.h)
-                            .range(1.0..=ph)
-                            .speed(1.0),
-                    );
-                    if ui.small_button("Whole page").clicked() {
-                        d.rect = LinkRect {
-                            page: d.rect.page,
-                            x: 0.0,
-                            y: 0.0,
-                            w: pw,
-                            h: ph,
-                        };
-                    }
-                    caption(ui, &format!("Page is {pw:.0} × {ph:.0} pt"));
-                });
+                self.selected = Some(LinkSel::Draft(self.drafts.len() - 1));
+                self.focus_url = true;
+            }
+            self.drag = None;
+        }
+        if resp.clicked() {
+            self.selected = pointer.and_then(|pos| {
+                let pt = to_pts(pos);
+                self.hit(pt.x, pt.y)
             });
         }
-        if let Some(i) = del {
-            self.drafts.remove(i);
+        if let Some(pos) = resp.hover_pos() {
+            let pt = to_pts(pos);
+            let icon = match self.hit(pt.x, pt.y) {
+                Some(LinkSel::Draft(_)) => egui::CursorIcon::Move,
+                Some(LinkSel::Existing(_)) => egui::CursorIcon::PointingHand,
+                None => egui::CursorIcon::Crosshair,
+            };
+            ui.ctx().set_cursor_icon(icon);
         }
-        caption(
-            ui,
-            "Positions are in points (1/72 inch), measured from the top-left corner of the page as displayed.",
-        );
 
+        // Link boxes.
+        let painter = ui.painter().with_clip_rect(area);
+        for (i, (l, removed)) in self
+            .existing
+            .iter()
+            .enumerate()
+            .filter(|(_, (l, _))| l.rect.page == self.page)
+        {
+            let r = to_screen(&l.rect);
+            let selected = self.selected == Some(LinkSel::Existing(i));
+            let c = if *removed {
+                LINK_RED.gamma_multiply(0.35)
+            } else {
+                LINK_RED
+            };
+            painter.rect(
+                r,
+                2.0,
+                c.gamma_multiply(0.12),
+                Stroke::new(if selected { 3.0 } else { 1.5 }, c),
+                StrokeKind::Outside,
+            );
+            if *removed {
+                painter.line_segment([r.left_top(), r.right_bottom()], Stroke::new(1.5, c));
+                painter.line_segment([r.right_top(), r.left_bottom()], Stroke::new(1.5, c));
+            }
+        }
+        for (i, d) in self
+            .drafts
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.rect.page == self.page)
+        {
+            let r = to_screen(&d.rect);
+            let selected = self.selected == Some(LinkSel::Draft(i));
+            painter.rect(
+                r,
+                2.0,
+                p.accent.gamma_multiply(0.22),
+                Stroke::new(if selected { 3.0 } else { 1.5 }, p.accent),
+                StrokeKind::Outside,
+            );
+            if selected {
+                let label = shorten(&Self::target_text(d), 40);
+                let galley = painter.layout_no_wrap(
+                    format!("{I_LINK}  {label}"),
+                    FontId::proportional(12.0),
+                    p.on_accent,
+                );
+                let tag = Rect::from_min_size(
+                    r.left_top() - Vec2::new(0.0, galley.size().y + 8.0),
+                    galley.size() + Vec2::new(12.0, 6.0),
+                );
+                painter.rect_filled(tag, 4.0, p.accent);
+                painter.galley(tag.min + Vec2::new(6.0, 3.0), galley, p.on_accent);
+            }
+        }
+        if let Some(r) = rubber {
+            let r = to_screen(&LinkRect {
+                page: self.page,
+                x: r.min.x,
+                y: r.min.y,
+                w: r.width(),
+                h: r.height(),
+            });
+            painter.rect(
+                r,
+                2.0,
+                p.accent.gamma_multiply(0.15),
+                Stroke::new(2.0, p.accent),
+                StrokeKind::Outside,
+            );
+        }
+    }
+
+    /// Right column: the selected link, the links on this page and Save.
+    fn side_panel(&mut self, ui: &mut egui::Ui, path: &Path, pages: u32) -> Option<Task> {
+        let p = Palette::current(ui);
+        let height = ui.available_height();
+        let mut action = None;
+        egui::Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(8.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_height(height - 34.0);
+                egui::ScrollArea::vertical().id_salt("link_side").auto_shrink([false, false]).show(ui, |ui| {
+                    // --- Selected link ---
+                    match self.selected {
+                        Some(LinkSel::Draft(i)) if i < self.drafts.len() => {
+                            ui.label(strong(format!("{I_LINK}  New link")).size(15.0));
+                            ui.add_space(6.0);
+                            let (pw, ph) = self.page_size(self.drafts[i].rect.page);
+                            let d = &mut self.drafts[i];
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut d.to_page, false, "Web address");
+                                ui.radio_value(&mut d.to_page, true, "Go to page");
+                            });
+                            if d.to_page {
+                                ui.horizontal(|ui| {
+                                    ui.label("Page");
+                                    ui.add(egui::DragValue::new(&mut d.page).range(1..=pages));
+                                });
+                            } else {
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(&mut d.url)
+                                        .hint_text("https://example.com")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if self.focus_url {
+                                    edit.request_focus();
+                                    self.focus_url = false;
+                                }
+                            }
+                            ui.add_space(8.0);
+                            caption(ui, "Position on the page (points, from the top-left):");
+                            egui::Grid::new("link_pos").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                                ui.label("x");
+                                ui.add(egui::DragValue::new(&mut d.rect.x).range(0.0..=pw).speed(1.0));
+                                ui.label("y");
+                                ui.add(egui::DragValue::new(&mut d.rect.y).range(0.0..=ph).speed(1.0));
+                                ui.end_row();
+                                ui.label("width");
+                                ui.add(egui::DragValue::new(&mut d.rect.w).range(1.0..=pw).speed(1.0));
+                                ui.label("height");
+                                ui.add(egui::DragValue::new(&mut d.rect.h).range(1.0..=ph).speed(1.0));
+                                ui.end_row();
+                            });
+                            ui.add_space(8.0);
+                            let mut delete = false;
+                            ui.horizontal(|ui| {
+                                if ui.button("Whole page").clicked() {
+                                    d.rect = LinkRect { page: d.rect.page, x: 0.0, y: 0.0, w: pw, h: ph };
+                                }
+                                delete = ui.button(labeled(I_DELETE, "Delete")).clicked();
+                            });
+                            if delete {
+                                self.drafts.remove(i);
+                                self.selected = None;
+                            }
+                        }
+                        Some(LinkSel::Existing(i)) if i < self.existing.len() => {
+                            ui.label(strong(format!("{I_LINK}  Existing link")).size(15.0));
+                            ui.add_space(6.0);
+                            let (l, removed) = &mut self.existing[i];
+                            ui.add(egui::Label::new(l.target.clone()).wrap());
+                            caption(ui, &format!("x {:.0}, y {:.0} · {:.0} × {:.0} pt", l.rect.x, l.rect.y, l.rect.w, l.rect.h));
+                            ui.add_space(8.0);
+                            let text = if *removed { labeled(I_ADD, "Keep this link") } else { labeled(I_DELETE, "Remove this link") };
+                            if ui.button(text).clicked() {
+                                *removed = !*removed;
+                            }
+                            if *removed {
+                                ui.colored_label(p.error, "Will be removed when you save.");
+                            }
+                        }
+                        _ => {
+                            ui.label(strong("Add a link").size(15.0));
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(secondary(
+                                    ui,
+                                    "Drag on the page to draw the clickable area, then type the web address \
+                                     or choose a page to jump to. Click any box to select it.",
+                                ))
+                                .wrap(),
+                            );
+                        }
+                    }
+
+                    // --- Links on this page ---
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(strong(format!("Links on page {}", self.page)));
+                    let mut clicked = None;
+                    let mut any = false;
+                    for (i, (l, removed)) in self.existing.iter().enumerate().filter(|(_, (l, _))| l.rect.page == self.page) {
+                        any = true;
+                        let text = RichText::new(format!("●  {}", shorten(&l.target, 34)))
+                            .color(if *removed { p.text2 } else { p.text });
+                        let text = if *removed { text.strikethrough() } else { text };
+                        if ui.selectable_label(self.selected == Some(LinkSel::Existing(i)), text).clicked() {
+                            clicked = Some(LinkSel::Existing(i));
+                        }
+                    }
+                    for (i, d) in self.drafts.iter().enumerate().filter(|(_, d)| d.rect.page == self.page) {
+                        any = true;
+                        let text = RichText::new(format!("+  {}", shorten(&Self::target_text(d), 34))).color(p.accent);
+                        if ui.selectable_label(self.selected == Some(LinkSel::Draft(i)), text).clicked() {
+                            clicked = Some(LinkSel::Draft(i));
+                        }
+                    }
+                    if !any {
+                        caption(ui, "No links on this page yet.");
+                    }
+                    if clicked.is_some() {
+                        self.selected = clicked;
+                    }
+                });
+            });
+
+        // --- Save ---
         let removing: Vec<(u32, usize)> = self
             .existing
             .iter()
@@ -1663,80 +2077,38 @@ impl LinksState {
             .map(|(l, _)| (l.rect.page, l.index))
             .collect();
         let changes = removing.len() + self.drafts.len();
-        let path = self.src.path.clone()?;
-        if footer(ui, changes > 0, &labeled(I_SAVE, "Save links")) {
-            let out = save_as(Some(&path), "links", "pdf")?;
-            let add: Vec<NewLink> = self
-                .drafts
-                .iter()
-                .map(|d| NewLink {
-                    rect: d.rect.clone(),
-                    target: if d.to_page {
-                        LinkTarget::Page(d.page)
-                    } else {
-                        LinkTarget::Url(d.url.clone())
-                    },
-                })
-                .collect();
-            return task("Saving links", move |pr| {
-                pdf::links::apply(&path, &out, &removing, &add, pr)
-            });
-        }
-        if let Some(path) = self.src.path.clone() {
-            let p = Palette::current(ui);
-            let sizes = &self.sizes;
-            let existing = &self.existing;
-            let drafts = &self.drafts;
-            pages_header(ui, self.src.pages);
-            caption(
-                ui,
-                "Red boxes are existing links (faded when marked for removal); blue boxes are new links.",
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let label = labeled(
+                I_SAVE,
+                &format!(
+                    "Save ({} new, {} removed)",
+                    self.drafts.len(),
+                    removing.len()
+                ),
             );
-            page_grid(
-                ui,
-                thumbs,
-                &path,
-                self.src.pages,
-                |_| TileStyle::default(),
-                |painter, page, shown| {
-                    let Some(&(pw, ph)) = sizes.get(page as usize - 1) else {
-                        return;
-                    };
-                    let to_screen = |r: &LinkRect| {
-                        Rect::from_min_size(
-                            shown.min
-                                + Vec2::new(r.x / pw * shown.width(), r.y / ph * shown.height()),
-                            Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
-                        )
-                    };
-                    let red = Color32::from_rgb(0xE8, 0x11, 0x23);
-                    for (l, remove) in existing.iter().filter(|(l, _)| l.rect.page == page) {
-                        let c = if *remove {
-                            red.gamma_multiply(0.3)
+            if accent_button(ui, changes > 0, &label)
+                && let Some(out) = save_as(Some(path), "links", "pdf")
+            {
+                let add: Vec<NewLink> = self
+                    .drafts
+                    .iter()
+                    .map(|d| NewLink {
+                        rect: d.rect.clone(),
+                        target: if d.to_page {
+                            LinkTarget::Page(d.page)
                         } else {
-                            red
-                        };
-                        painter.rect(
-                            to_screen(&l.rect),
-                            1.0,
-                            c.gamma_multiply(0.15),
-                            Stroke::new(1.5, c),
-                            StrokeKind::Inside,
-                        );
-                    }
-                    for d in drafts.iter().filter(|d| d.rect.page == page) {
-                        painter.rect(
-                            to_screen(&d.rect),
-                            1.0,
-                            p.accent.gamma_multiply(0.25),
-                            Stroke::new(1.5, p.accent),
-                            StrokeKind::Inside,
-                        );
-                    }
-                },
-            );
-        }
-        None
+                            LinkTarget::Url(d.url.clone())
+                        },
+                    })
+                    .collect();
+                let path = path.to_path_buf();
+                action = task("Saving links", move |pr| {
+                    pdf::links::apply(&path, &out, &removing, &add, pr)
+                });
+            }
+        });
+        action
     }
 }
 

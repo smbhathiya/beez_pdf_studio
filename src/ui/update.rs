@@ -239,10 +239,7 @@ impl UpdateUi {
     /// "Version x.y.z · Check for updates" line for the bottom of Home.
     pub fn footer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            caption(
-                ui,
-                &format!("Beez PDF Studio · Version {CURRENT_VERSION}"),
-            );
+            caption(ui, &format!("Beez PDF Studio · Version {CURRENT_VERSION}"));
             let checking = matches!(
                 self.state,
                 State::Checking { .. } | State::Installing { .. }
