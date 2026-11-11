@@ -45,6 +45,8 @@ pub struct Thumbs {
     rx: Receiver<Rendered>,
     slots: HashMap<Key, Slot>,
     viewer: Option<Viewer>,
+    /// Shared decoder for image files (Images to PDF).
+    image_worker: Option<Sender<(PathBuf, Request)>>,
     /// Thumbnail size multiplier shared by all page grids.
     pub zoom: f32,
 }
@@ -58,6 +60,7 @@ impl Default for Thumbs {
             rx,
             slots: HashMap::new(),
             viewer: None,
+            image_worker: None,
             zoom: 1.0,
         }
     }
@@ -93,13 +96,21 @@ impl Thumbs {
     fn request(&mut self, ctx: &egui::Context, path: &Path, page: u32, size: u32) -> &Slot {
         let key = (path.to_path_buf(), Request { page, size });
         if !self.slots.contains_key(&key) {
-            let worker = self.workers.entry(path.to_path_buf()).or_insert_with(|| {
-                let ctx = ctx.clone();
-                render::spawn_worker(path.to_path_buf(), self.tx.clone(), move || {
-                    ctx.request_repaint()
-                })
-            });
-            let _ = worker.send(key.1);
+            if is_pdf(path) {
+                let worker = self.workers.entry(path.to_path_buf()).or_insert_with(|| {
+                    let ctx = ctx.clone();
+                    render::spawn_worker(path.to_path_buf(), self.tx.clone(), move || {
+                        ctx.request_repaint()
+                    })
+                });
+                let _ = worker.send(key.1);
+            } else {
+                let worker = self.image_worker.get_or_insert_with(|| {
+                    let ctx = ctx.clone();
+                    render::spawn_image_worker(self.tx.clone(), move || ctx.request_repaint())
+                });
+                let _ = worker.send(key.clone());
+            }
             self.slots.insert(key.clone(), Slot::Loading);
         }
         &self.slots[&key]
@@ -265,7 +276,9 @@ impl Thumbs {
                 ui.set_width(size.x);
                 ui.horizontal(|ui| {
                     ui.label(strong(file_label(&item.path)).size(15.0));
-                    ui.label(secondary(ui, format!("Page {}", item.page)));
+                    if item.page > 0 {
+                        ui.label(secondary(ui, format!("Page {}", item.page)));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, true, I_CLOSE, "Close (Esc)") {
                             close = true;
@@ -504,4 +517,307 @@ pub fn selected_pages(spec: &str, total: u32) -> Option<HashSet<u32>> {
     crate::pdf::parse_ranges(spec, total)
         .ok()
         .map(|r| crate::pdf::expand_ranges(&r).into_iter().collect())
+}
+
+fn is_pdf(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+// ---------------------------------------------------------------------------------------
+// Drag & drop helpers
+// ---------------------------------------------------------------------------------------
+
+/// Foreground painter for drag feedback (drawn above everything else).
+pub fn drag_painter(ctx: &egui::Context) -> egui::Painter {
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("drag_feedback"),
+    ))
+}
+
+/// Red "drop here to delete" zone along the bottom of `clip`. Returns true while `pos` is over it.
+pub fn trash_zone(ctx: &egui::Context, clip: Rect, pos: egui::Pos2, what: &str) -> bool {
+    let p = Palette::of(ctx.global_style().visuals.dark_mode);
+    let zone = Rect::from_center_size(
+        egui::pos2(clip.center().x, clip.bottom() - 44.0),
+        Vec2::new(clip.width().min(420.0), 60.0),
+    );
+    let over = zone.contains(pos);
+    let (fill, stroke) = if over {
+        (p.error, p.error)
+    } else {
+        (p.error_bg, p.error.gamma_multiply(0.7))
+    };
+    let painter = drag_painter(ctx);
+    painter.rect(
+        zone,
+        10.0,
+        fill,
+        Stroke::new(2.0, stroke),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        zone.center(),
+        Align2::CENTER_CENTER,
+        format!("{I_DELETE}   Drop here to remove {what}"),
+        FontId::new(15.0, semibold()),
+        if over { Color32::WHITE } else { p.error },
+    );
+    over
+}
+
+/// Auto-scroll the surrounding scroll area while dragging near its top or bottom edge.
+pub fn drag_autoscroll(ui: &egui::Ui, clip: Rect, pos: egui::Pos2, over_trash: bool) {
+    if pos.y < clip.top() + 40.0 {
+        ui.scroll_with_delta(Vec2::new(0.0, 12.0));
+    } else if pos.y > clip.bottom() - 90.0 && !over_trash {
+        ui.scroll_with_delta(Vec2::new(0.0, -12.0));
+    }
+}
+
+/// Insertion index for a grid: before/after the tile nearest to `pos`.
+pub fn grid_insert_index(rects: &[Rect], pos: egui::Pos2) -> usize {
+    rects
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            a.1.center()
+                .distance(pos)
+                .total_cmp(&b.1.center().distance(pos))
+        })
+        .map(|(j, r)| if pos.x < r.center().x { j } else { j + 1 })
+        .unwrap_or(0)
+}
+
+/// Draw the vertical accent marker where grid items will be inserted.
+pub fn grid_insert_marker(ctx: &egui::Context, rects: &[Rect], at: usize) {
+    let Some(last) = rects.last() else { return };
+    let p = Palette::of(ctx.global_style().visuals.dark_mode);
+    let (r, x) = if at < rects.len() {
+        (rects[at], rects[at].left() - 7.0)
+    } else {
+        (*last, last.right() + 7.0)
+    };
+    drag_painter(ctx).line_segment(
+        [
+            egui::pos2(x, r.top() + 6.0),
+            egui::pos2(x, r.bottom() - 6.0),
+        ],
+        Stroke::new(4.0, p.accent),
+    );
+}
+
+/// Move element `from` so that it lands before index `at` (index in the original order).
+pub fn move_item<T>(items: &mut Vec<T>, from: usize, at: usize) {
+    if from >= items.len() {
+        return;
+    }
+    let item = items.remove(from);
+    let at = if at > from { at - 1 } else { at }.min(items.len());
+    items.insert(at, item);
+}
+
+/// A grid of thumbnails (one per item) that can be dragged to reorder, dragged onto the
+/// delete zone (or removed with the × button) and clicked to open the viewer.
+/// `describe` returns the item's preview source, a title and a subtitle.
+pub fn sortable_grid<T>(
+    ui: &mut egui::Ui,
+    thumbs: &mut Thumbs,
+    drag: &mut Option<usize>,
+    items: &mut Vec<T>,
+    what: &str,
+    describe: impl Fn(&T) -> (ViewItem, String, String),
+) {
+    let p = Palette::current(ui);
+    ui.horizontal(|ui| {
+        caption(
+            ui,
+            "Drag to reorder · drop on the red zone or use × to remove · click to view.",
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Slider::new(&mut thumbs.zoom, 0.6..=2.2).show_value(false));
+            caption(ui, "Thumbnail size");
+        });
+    });
+    ui.add_space(4.0);
+
+    let tile = Vec2::new(150.0, 196.0) * thumbs.zoom;
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let clip = ui.clip_rect();
+    let mut rects = Vec::with_capacity(items.len());
+    let (mut started, mut open, mut remove) = (None, None, None);
+
+    egui::Frame::new()
+        .fill(if p.dark {
+            Color32::from_rgb(0x1C, 0x1C, 0x1C)
+        } else {
+            Color32::from_rgb(0xEB, 0xEB, 0xEB)
+        })
+        .corner_radius(8.0)
+        .inner_margin(14.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
+                for (i, it) in items.iter().enumerate() {
+                    let (view, title, sub) = describe(it);
+                    let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                    rects.push(rect);
+                    let hovered = resp.hovered() && drag.is_none();
+                    if hovered {
+                        ui.painter().rect_filled(rect, 8.0, p.card_hover);
+                    }
+                    let area = Rect::from_min_max(
+                        rect.min + Vec2::splat(10.0),
+                        rect.max - Vec2::new(10.0, 46.0),
+                    );
+                    thumbs.paint_page(ui, &view.path, view.page, THUMB, view.rotate, area);
+                    let painter = ui.painter().with_clip_rect(rect);
+                    // Position badge.
+                    let badge =
+                        Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(26.0, 20.0));
+                    painter.rect_filled(badge, 4.0, p.accent);
+                    painter.text(
+                        badge.center(),
+                        Align2::CENTER_CENTER,
+                        (i + 1).to_string(),
+                        FontId::new(11.0, semibold()),
+                        p.on_accent,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() + 10.0, rect.bottom() - 38.0),
+                        Align2::LEFT_TOP,
+                        title,
+                        FontId::proportional(12.0),
+                        p.text,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0),
+                        Align2::LEFT_TOP,
+                        sub,
+                        FontId::proportional(11.0),
+                        p.text2,
+                    );
+                    if *drag == Some(i) {
+                        ui.painter()
+                            .rect_filled(rect, 8.0, p.bg.gamma_multiply(0.75));
+                    }
+                    // × remove button (on hover).
+                    let x_rect = Rect::from_min_size(
+                        rect.right_top() + Vec2::new(-30.0, 6.0),
+                        Vec2::splat(24.0),
+                    );
+                    let x_resp =
+                        ui.interact(x_rect, ui.make_persistent_id(("remove", i)), Sense::click());
+                    if hovered || x_resp.hovered() {
+                        let fill = if x_resp.hovered() { p.error } else { p.card };
+                        ui.painter().circle(
+                            x_rect.center(),
+                            12.0,
+                            fill,
+                            Stroke::new(1.0, p.border),
+                        );
+                        ui.painter().text(
+                            x_rect.center(),
+                            Align2::CENTER_CENTER,
+                            I_CLOSE,
+                            FontId::proportional(10.0),
+                            if x_resp.hovered() {
+                                Color32::WHITE
+                            } else {
+                                p.text
+                            },
+                        );
+                    }
+                    if x_resp.on_hover_text("Remove").clicked() {
+                        remove = Some(i);
+                    } else if resp.drag_started() {
+                        started = Some(i);
+                    } else if resp.clicked() {
+                        open = Some(i);
+                    }
+                }
+            });
+        });
+
+    if let Some(i) = started {
+        *drag = Some(i);
+    }
+    if let (Some(from), Some(pos)) = (*drag, pointer) {
+        let ctx = ui.ctx().clone();
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        let over_trash = trash_zone(&ctx, clip, pos, what);
+        let insert = (!over_trash).then(|| grid_insert_index(&rects, pos));
+        if let Some(at) = insert {
+            grid_insert_marker(&ctx, &rects, at);
+        }
+        if let Some(it) = items.get(from) {
+            let (view, _, _) = describe(it);
+            egui::Area::new(egui::Id::unique("sortable_ghost"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(pos + Vec2::new(12.0, 12.0))
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    let (r, _) = ui.allocate_exact_size(tile * 0.7, Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, 8.0, p.card.gamma_multiply(0.95));
+                    ui.painter().rect_stroke(
+                        r,
+                        8.0,
+                        Stroke::new(2.0, p.accent),
+                        StrokeKind::Inside,
+                    );
+                    thumbs.paint_page(
+                        ui,
+                        &view.path,
+                        view.page,
+                        THUMB,
+                        view.rotate,
+                        r.shrink(10.0),
+                    );
+                });
+        }
+        drag_autoscroll(ui, clip, pos, over_trash);
+        if ui.input(|i| i.pointer.any_released()) {
+            if over_trash {
+                if from < items.len() {
+                    items.remove(from);
+                }
+            } else if let Some(at) = insert {
+                move_item(items, from, at);
+            }
+            *drag = None;
+        }
+        ctx.request_repaint();
+    } else if drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+        *drag = None;
+    }
+
+    if let Some(i) = remove {
+        items.remove(i);
+    } else if let Some(i) = open {
+        let views = items.iter().map(|it| describe(it).0).collect();
+        thumbs.open_viewer(views, i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_item;
+
+    #[test]
+    fn move_item_positions() {
+        let mut v = vec![1, 2, 3, 4];
+        move_item(&mut v, 0, 3);
+        assert_eq!(v, [2, 3, 1, 4]);
+        let mut v = vec![1, 2, 3, 4];
+        move_item(&mut v, 3, 0);
+        assert_eq!(v, [4, 1, 2, 3]);
+        let mut v = vec![1, 2, 3, 4];
+        move_item(&mut v, 1, 4);
+        assert_eq!(v, [1, 3, 4, 2]);
+        let mut v = vec![1, 2, 3, 4];
+        move_item(&mut v, 2, 2);
+        assert_eq!(v, [1, 2, 3, 4]);
+    }
 }

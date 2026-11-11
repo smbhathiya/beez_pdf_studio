@@ -124,6 +124,85 @@ fn worker(path: &Path, rx: Receiver<Request>, results: Sender<Rendered>, wake: i
     }
 }
 
+/// Start the shared image-thumbnail worker (for Images to PDF). Requests carry the file
+/// path; `page` is ignored. EXIF rotation from phone photos is applied.
+pub fn spawn_image_worker(
+    results: Sender<Rendered>,
+    wake: impl Fn() + Send + 'static,
+) -> Sender<(PathBuf, Request)> {
+    let (tx, rx) = mpsc::channel::<(PathBuf, Request)>();
+    std::thread::Builder::new()
+        .name("image thumbnails".into())
+        .spawn(move || {
+            let mut queue: Vec<(PathBuf, Request)> = Vec::new();
+            let mut done: HashSet<(PathBuf, Request)> = HashSet::new();
+            loop {
+                if queue.is_empty() {
+                    match rx.recv() {
+                        Ok(r) => queue.push(r),
+                        Err(_) => return,
+                    }
+                }
+                while let Ok(r) = rx.try_recv() {
+                    queue.push(r);
+                }
+                let Some((path, req)) = queue.pop() else {
+                    continue;
+                };
+                if !done.insert((path.clone(), req)) {
+                    continue;
+                }
+                let bitmap = std::panic::catch_unwind(|| decode_image(&path, req.size))
+                    .ok()
+                    .flatten();
+                if results
+                    .send(Rendered {
+                        path,
+                        request: req,
+                        bitmap,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                wake();
+            }
+        })
+        .expect("spawning a thread");
+    tx
+}
+
+fn decode_image(path: &Path, size: u32) -> Option<Bitmap> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    if img.width().max(img.height()) > size {
+        img = img.thumbnail(size, size);
+    }
+    // Composite transparency over white, like it will appear on a PDF page.
+    let rgba = img.to_rgba8();
+    let mut out = Vec::with_capacity(rgba.len());
+    for px in rgba.pixels() {
+        let [r, g, b, a] = px.0;
+        let a = a as u32;
+        let over = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+        out.extend_from_slice(&[over(r), over(g), over(b), 255]);
+    }
+    Some(Bitmap {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: out,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

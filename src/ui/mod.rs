@@ -475,6 +475,7 @@ impl eframe::App for App {
         if self.tool.is_some()
             && self.running.is_none()
             && !self.thumbs.viewer_open()
+            && !self.update.dialog_open()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.tool = None;
@@ -500,17 +501,14 @@ impl eframe::App for App {
                 top: 28,
                 bottom: 16,
             }))
-            .show(ui, |ui| {
-                self.update.banner(ui);
-                match self.tool {
-                    None => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("home")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.home(ui));
-                    }
-                    Some(tool) => action = self.tool_page(ui, tool),
+            .show(ui, |ui| match self.tool {
+                None => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("home")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.home(ui));
                 }
+                Some(tool) => action = self.tool_page(ui, tool),
             });
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -532,6 +530,7 @@ impl eframe::App for App {
         }
 
         self.thumbs.show_viewer(&ctx);
+        self.update.dialog(&ctx);
 
         if let Some(t) = action {
             self.start(&ctx, t);

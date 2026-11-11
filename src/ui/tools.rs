@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 
 use super::preview::{
-    THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header, selected_pages,
+    self, THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header, selected_pages,
 };
 use super::theme::*;
 use crate::pdf::{
@@ -275,6 +275,8 @@ fn footer(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
 #[derive(Default)]
 pub struct MergeState {
     items: Vec<(PathBuf, u32, String)>,
+    /// Index of the file being dragged by its handle.
+    drag: Option<usize>,
 }
 
 impl MergeState {
@@ -306,11 +308,32 @@ impl MergeState {
                 ));
             });
         }
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let clip = ui.clip_rect();
+        let mut card_rects: Vec<Rect> = Vec::with_capacity(self.items.len());
+        let mut started = None;
         let mut i = 0;
         while i < self.items.len() {
+            let top = ui.cursor().top();
             let removed = card(ui, |ui| {
                 let removed = ui
                     .horizontal(|ui| {
+                        let grip = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(I_GRIP)
+                                        .size(16.0)
+                                        .color(Palette::current(ui).text2),
+                                )
+                                .sense(Sense::drag()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text(
+                                "Drag to change the order, or onto the red zone to remove",
+                            );
+                        if grip.drag_started() {
+                            started = Some(i);
+                        }
                         ui.label(secondary(ui, format!("{:>2}", i + 1)));
                         ui.label(RichText::new(I_DOCUMENT).size(18.0));
                         ui.vertical(|ui| {
@@ -347,10 +370,84 @@ impl MergeState {
                 }
                 removed
             });
+            card_rects.push(Rect::from_x_y_ranges(
+                ui.max_rect().x_range(),
+                top..=ui.cursor().top() - 4.0,
+            ));
             if !removed {
                 i += 1;
             }
         }
+
+        // --- Drag files by their handle to reorder or remove them ---------------------
+        if let Some(i) = started {
+            self.drag = Some(i);
+        }
+        if let (Some(from), Some(pos)) = (self.drag, pointer) {
+            let ctx = ui.ctx().clone();
+            let p = Palette::current(ui);
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(r) = card_rects.get(from) {
+                ui.painter().rect_filled(*r, 8.0, p.bg.gamma_multiply(0.7));
+            }
+            let over_trash = preview::trash_zone(&ctx, clip, pos, "file");
+            let insert = (!over_trash).then(|| {
+                card_rects
+                    .iter()
+                    .position(|r| pos.y < r.center().y)
+                    .unwrap_or(card_rects.len())
+            });
+            if let (Some(at), Some(last)) = (insert, card_rects.last()) {
+                let (y, r) = if at < card_rects.len() {
+                    (card_rects[at].top() - 3.0, card_rects[at])
+                } else {
+                    (last.bottom() + 3.0, *last)
+                };
+                preview::drag_painter(&ctx).line_segment(
+                    [
+                        egui::pos2(r.left() + 8.0, y),
+                        egui::pos2(r.right() - 8.0, y),
+                    ],
+                    Stroke::new(4.0, p.accent),
+                );
+            }
+            if let Some((path, n, _)) = self.items.get(from) {
+                let (name, pages) = (file_name(path), *n);
+                egui::Area::new(egui::Id::unique("merge_ghost"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(pos + Vec2::new(14.0, 10.0))
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(p.card)
+                            .stroke(Stroke::new(2.0, p.accent))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(I_DOCUMENT).size(16.0));
+                                    ui.label(strong(name));
+                                    ui.label(secondary(ui, format!("{pages} pages")));
+                                });
+                            });
+                    });
+            }
+            preview::drag_autoscroll(ui, clip, pos, over_trash);
+            if ui.input(|i| i.pointer.any_released()) {
+                if over_trash {
+                    if from < self.items.len() {
+                        self.items.remove(from);
+                    }
+                } else if let Some(at) = insert {
+                    preview::move_item(&mut self.items, from, at);
+                }
+                self.drag = None;
+            }
+            ctx.request_repaint();
+        } else if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+        }
+
         caption(
             ui,
             "Page selection examples: 1-3, 5, 8-end. Leave the field empty to include every page.",
@@ -532,6 +629,8 @@ pub struct OrganizeState {
     tiles: Vec<Tile>,
     zoom: f32,
     error: Option<String>,
+    /// Tiles being dragged (indices into `tiles`), while a drag is in progress.
+    drag: Option<Vec<usize>>,
 }
 
 impl Default for OrganizeState {
@@ -542,6 +641,7 @@ impl Default for OrganizeState {
             tiles: vec![],
             zoom: 1.0,
             error: None,
+            drag: None,
         }
     }
 }
@@ -738,7 +838,7 @@ impl OrganizeState {
             ui.add_space(8.0);
             caption(
                 ui,
-                "Click to select (Ctrl / Shift for several). Double-click a page to view it full size.",
+                "Drag pages to reorder, or onto the delete zone to remove them. Ctrl / Shift selects several; double-click to view a page.",
             );
         });
         action
@@ -766,18 +866,26 @@ impl OrganizeState {
         let nsel = self.tiles.iter().filter(|t| t.selected).count();
         let tile = Vec2::new(120.0, 164.0) * self.zoom;
         let modifiers = ui.input(|i| i.modifiers);
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let clip = ui.clip_rect();
         let mut clicked = None;
         let mut view = None;
+        let mut drag_started = None;
+        let mut rects = Vec::with_capacity(self.tiles.len());
+        let dragging: Vec<usize> = self.drag.clone().unwrap_or_default();
+
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(14.0);
             for (i, t) in self.tiles.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(tile, Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                rects.push(rect);
                 let painter = ui.painter();
                 let color = SOURCE_COLORS[t.r.source % SOURCE_COLORS.len()];
+                let lifted = dragging.contains(&i);
                 if t.selected {
                     painter.rect_filled(rect, 8.0, p.accent.gamma_multiply(0.18));
                     painter.rect_stroke(rect, 8.0, Stroke::new(2.0, p.accent), StrokeKind::Inside);
-                } else if resp.hovered() {
+                } else if resp.hovered() && dragging.is_empty() {
                     painter.rect_filled(rect, 8.0, p.card_hover);
                 }
                 // Real page thumbnail, shown with the tile's rotation.
@@ -810,6 +918,10 @@ impl OrganizeState {
                     painter.rect_filled(r, 4.0, p.accent.gamma_multiply(0.9));
                     painter.galley(r.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE);
                 }
+                if lifted {
+                    // The page is "picked up": leave a faded placeholder behind.
+                    painter.rect_filled(rect, 8.0, p.bg.gamma_multiply(0.75));
+                }
                 painter.text(
                     rect.center_bottom() - Vec2::new(0.0, 10.0),
                     Align2::CENTER_BOTTOM,
@@ -817,18 +929,174 @@ impl OrganizeState {
                     FontId::proportional(12.0),
                     if t.selected { p.accent } else { p.text2 },
                 );
-                if resp.double_clicked() {
+                if resp.drag_started() {
+                    drag_started = Some(i);
+                } else if resp.double_clicked() {
                     view = Some(i);
                 } else if resp.clicked() {
                     clicked = Some(i);
                 }
-                resp.on_hover_text(format!(
-                    "{} · page {}",
-                    file_name(&self.sources[t.r.source]),
-                    t.r.page
-                ));
+                if dragging.is_empty() {
+                    resp.on_hover_text(format!(
+                        "{} · page {}",
+                        file_name(&self.sources[t.r.source]),
+                        t.r.page
+                    ))
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                }
             }
         });
+
+        // --- Drag & drop ------------------------------------------------------------------
+        if let Some(i) = drag_started {
+            // Dragging a selected page moves the whole selection; otherwise just that page.
+            let set: Vec<usize> = if self.tiles[i].selected {
+                (0..self.tiles.len())
+                    .filter(|&j| self.tiles[j].selected)
+                    .collect()
+            } else {
+                self.tiles.iter_mut().for_each(|t| t.selected = false);
+                self.tiles[i].selected = true;
+                vec![i]
+            };
+            self.drag = Some(set);
+        }
+
+        if let (Some(set), Some(pos)) = (self.drag.clone(), pointer) {
+            let ctx = ui.ctx().clone();
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let fg = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique("organizer_drag"),
+            ));
+
+            // Delete zone along the bottom of the visible grid.
+            let trash = Rect::from_center_size(
+                egui::pos2(clip.center().x, clip.bottom() - 44.0),
+                Vec2::new(clip.width().min(420.0), 60.0),
+            );
+            let over_trash = trash.contains(pos);
+            let (fill, stroke) = if over_trash {
+                (p.error, p.error)
+            } else {
+                (p.error_bg, p.error.gamma_multiply(0.7))
+            };
+            fg.rect(
+                trash,
+                10.0,
+                fill,
+                Stroke::new(2.0, stroke),
+                StrokeKind::Inside,
+            );
+            fg.text(
+                trash.center(),
+                Align2::CENTER_CENTER,
+                format!("{I_DELETE}   Drop here to delete {} page(s)", set.len()),
+                FontId::new(15.0, semibold()),
+                if over_trash { Color32::WHITE } else { p.error },
+            );
+
+            // Where the pages would be inserted: before/after the nearest tile.
+            let insert = (!over_trash).then(|| {
+                rects
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| {
+                        a.1.center()
+                            .distance(pos)
+                            .total_cmp(&b.1.center().distance(pos))
+                    })
+                    .map(|(j, r)| if pos.x < r.center().x { j } else { j + 1 })
+                    .unwrap_or(self.tiles.len())
+            });
+            if let Some(at) = insert {
+                // Vertical marker in the gap where the pages will land.
+                let (r, x) = if at < rects.len() {
+                    (rects[at], rects[at].left() - 7.0)
+                } else {
+                    let last = *rects.last().unwrap();
+                    (last, last.right() + 7.0)
+                };
+                fg.line_segment(
+                    [
+                        egui::pos2(x, r.top() + 6.0),
+                        egui::pos2(x, r.bottom() - 6.0),
+                    ],
+                    Stroke::new(4.0, p.accent),
+                );
+            }
+
+            // Floating preview of the dragged page under the cursor.
+            let first = self.tiles[set[0]].clone();
+            let ghost_size = tile * 0.8;
+            egui::Area::new(egui::Id::unique("organizer_ghost"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(pos + Vec2::new(12.0, 12.0))
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    let (r, _) = ui.allocate_exact_size(ghost_size, Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, 8.0, p.card.gamma_multiply(0.95));
+                    ui.painter().rect_stroke(
+                        r,
+                        8.0,
+                        Stroke::new(2.0, p.accent),
+                        StrokeKind::Inside,
+                    );
+                    thumbs.paint_page(
+                        ui,
+                        &self.sources[first.r.source],
+                        first.r.page,
+                        THUMB,
+                        first.r.rotate,
+                        r.shrink(10.0),
+                    );
+                    if set.len() > 1 {
+                        let c = r.right_top() + Vec2::new(-6.0, 6.0);
+                        ui.painter().circle_filled(c, 12.0, p.accent);
+                        ui.painter().text(
+                            c,
+                            Align2::CENTER_CENTER,
+                            set.len().to_string(),
+                            FontId::new(12.0, semibold()),
+                            p.on_accent,
+                        );
+                    }
+                });
+
+            // Scroll when dragging near the top or bottom edge.
+            if pos.y < clip.top() + 40.0 {
+                ui.scroll_with_delta(Vec2::new(0.0, 12.0));
+            } else if pos.y > clip.bottom() - 90.0 && !over_trash {
+                ui.scroll_with_delta(Vec2::new(0.0, -12.0));
+            }
+
+            if ui.input(|i| i.pointer.any_released()) {
+                if over_trash {
+                    let mut k = 0;
+                    self.tiles.retain(|_| {
+                        k += 1;
+                        !set.contains(&(k - 1))
+                    });
+                } else if let Some(at) = insert {
+                    self.move_tiles(&set, at);
+                }
+                self.drag = None;
+            }
+            ctx.request_repaint();
+        } else if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+        }
+
+        // The Delete key removes the selection.
+        if self.drag.is_none()
+            && nsel > 0
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.tiles.retain(|t| !t.selected);
+        }
+
         if let Some(i) = view {
             let items = self
                 .tiles
@@ -856,6 +1124,60 @@ impl OrganizeState {
                 self.tiles[i].selected = !only;
             }
         }
+    }
+
+    /// Move the tiles at `set` (sorted indices) so they land before position `at`.
+    fn move_tiles(&mut self, set: &[usize], at: usize) {
+        let moving: Vec<Tile> = set.iter().map(|&i| self.tiles[i].clone()).collect();
+        let before = set.iter().filter(|&&i| i < at).count();
+        let mut k = 0;
+        self.tiles.retain(|_| {
+            k += 1;
+            !set.contains(&(k - 1))
+        });
+        let at = (at - before).min(self.tiles.len());
+        self.tiles.splice(at..at, moving);
+    }
+}
+
+#[cfg(test)]
+mod organize_tests {
+    use super::*;
+
+    fn tiles(n: u32) -> OrganizeState {
+        OrganizeState {
+            tiles: (1..=n)
+                .map(|page| Tile {
+                    r: PageRef {
+                        source: 0,
+                        page,
+                        rotate: 0,
+                    },
+                    selected: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn order(o: &OrganizeState) -> Vec<u32> {
+        o.tiles.iter().map(|t| t.r.page).collect()
+    }
+
+    #[test]
+    fn move_tiles_forward_backward_and_groups() {
+        let mut o = tiles(5);
+        o.move_tiles(&[0], 3); // page 1 dropped before page 4
+        assert_eq!(order(&o), [2, 3, 1, 4, 5]);
+        let mut o = tiles(5);
+        o.move_tiles(&[4], 0); // last page to the front
+        assert_eq!(order(&o), [5, 1, 2, 3, 4]);
+        let mut o = tiles(5);
+        o.move_tiles(&[1, 3], 5); // pages 2 and 4 to the end
+        assert_eq!(order(&o), [1, 3, 5, 2, 4]);
+        let mut o = tiles(5);
+        o.move_tiles(&[2], 2); // dropped where it already is
+        assert_eq!(order(&o), [1, 2, 3, 4, 5]);
     }
 }
 
@@ -994,6 +1316,8 @@ impl CompressState {
 pub struct ImagesState {
     images: Vec<PathBuf>,
     opts: ImageOptions,
+    /// Index of the image being dragged in the preview grid.
+    drag: Option<usize>,
 }
 
 const MAX_SIZES: [(u32, &str); 6] = [
@@ -1011,7 +1335,7 @@ impl ImagesState {
             .extend(paths.into_iter().filter(|p| has_ext(p, IMG_EXT)));
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, _thumbs: &mut Thumbs) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         ui.horizontal(|ui| {
             if ui.button(labeled(I_ADD, "Add images…")).clicked() {
                 self.add(pick_files("Images", IMG_EXT));
@@ -1024,11 +1348,8 @@ impl ImagesState {
             }
         });
 
-        section(
-            ui,
-            &format!("Images · one per page ({})", self.images.len()),
-        );
         if self.images.is_empty() {
+            section(ui, "Images");
             card(ui, |ui| {
                 ui.label(secondary(
                     ui,
@@ -1042,32 +1363,17 @@ impl ImagesState {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            card(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        let mut i = 0;
-                        while i < self.images.len() {
-                            let removed = ui
-                                .horizontal(|ui| {
-                                    ui.label(secondary(ui, format!("{:>3}", i + 1)));
-                                    ui.label(RichText::new(I_PHOTO).size(15.0));
-                                    ui.label(file_name(&self.images[i]));
-                                    ui.label(secondary(ui, file_size(&self.images[i])).size(12.0));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| row_controls(ui, &mut self.images, i),
-                                    )
-                                    .inner
-                                })
-                                .inner;
-                            if !removed {
-                                i += 1;
-                            }
-                        }
-                    });
-                caption(ui, &format!("Total {}", pdf::human_size(total)));
-            });
+            section(ui, "Images");
+            setting(
+                ui,
+                I_PHOTO,
+                &format!("{} image(s), one per page", self.images.len()),
+                &format!(
+                    "{} in total · arrange them in the preview below",
+                    pdf::human_size(total)
+                ),
+                |_| {},
+            );
         }
 
         section(ui, "Image quality");
@@ -1161,6 +1467,20 @@ impl ImagesState {
                 format!("Optimising and converting {n} image(s)"),
                 move || pdf::images::images_to_pdf(&imgs, &opts, &out),
             );
+        }
+        if !self.images.is_empty() {
+            section(ui, &format!("Order of pages ({})", self.images.len()));
+            preview::sortable_grid(ui, thumbs, &mut self.drag, &mut self.images, "image", |p| {
+                (
+                    ViewItem {
+                        path: p.clone(),
+                        page: 0,
+                        rotate: 0,
+                    },
+                    file_name(p),
+                    file_size(p),
+                )
+            });
         }
         None
     }
