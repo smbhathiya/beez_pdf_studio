@@ -2,8 +2,11 @@
 #
 #   git tag v0.2.0 && git push origin v0.2.0
 #
-# The release asset name contains the target triple and the zip holds `util_bee.exe`,
-# which is exactly what the in-app updater (src/updater.rs) looks for.
+# Release assets:
+#   * UtilBee-PDF-Studio-Setup-vX.Y.Z.exe — the installer for new users.
+#   * UtilBee-PDF-Studio-vX.Y.Z-x86_64-pc-windows-msvc.zip — the portable app. Its name contains
+#     the target triple and it holds `util_bee.exe`, which is what the in-app updater
+#     (src/updater.rs) downloads. The installer's name must NOT contain the target triple.
 
 name: Release
 
@@ -18,7 +21,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -31,6 +34,7 @@ jobs:
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version"
           }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Test
         run: cargo test --release
@@ -38,18 +42,40 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Package
+      - name: Package portable zip
         shell: pwsh
         run: |
-          $asset = "UtilBee-PDF-Studio-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
-          Compress-Archive -Path target/release/util_bee.exe -DestinationPath $asset
-          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $zip = "UtilBee-PDF-Studio-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path target/release/util_bee.exe -DestinationPath $zip
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup compiler not found" }
+          & $iscc "/DAppVersion=$env:VERSION" installer/utilbee.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+          "SETUP=dist/UtilBee-PDF-Studio-Setup-v$env:VERSION.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Publish release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" "$env:ASSET" `
+          $notes = @"
+          ## Download
+
+          - **New install:** download ``UtilBee-PDF-Studio-Setup-v$env:VERSION.exe``, run it and follow the steps. No administrator rights are needed.
+          - **Portable:** download the ``.zip``, extract it and run ``util_bee.exe``.
+          - **Already installed?** The app updates itself: open it and click **Update now**.
+
+          "@
+          gh release create "${{ github.ref_name }}" "$env:SETUP" "$env:ZIP" `
             --title "UtilBee PDF Studio ${{ github.ref_name }}" `
+            --notes "$notes" `
             --generate-notes

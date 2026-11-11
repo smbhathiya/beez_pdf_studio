@@ -4,8 +4,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+};
 
+use super::preview::{
+    THUMB, Thumbs, TileStyle, ViewItem, page_grid, page_strip, pages_header, selected_pages,
+};
 use super::theme::*;
 use crate::pdf::{
     self,
@@ -177,7 +182,7 @@ impl Source {
     }
 
     /// Returns true when the file changed.
-    fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+    fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> bool {
         let (name, info) = match &self.path {
             Some(p) => {
                 let pages = if self.pages > 0 {
@@ -205,10 +210,31 @@ impl Source {
         });
         match picked {
             Some(p) => {
+                thumbs.invalidate(&p);
                 self.set(p);
                 true
             }
             None => false,
+        }
+    }
+
+    /// "Pages" section with a thumbnail of every page; `dim` fades pages out.
+    fn preview(&self, ui: &mut egui::Ui, thumbs: &mut Thumbs, dim: impl Fn(u32) -> bool) {
+        if let Some(path) = &self.path
+            && self.pages > 0
+        {
+            pages_header(ui, self.pages);
+            page_grid(
+                ui,
+                thumbs,
+                path,
+                self.pages,
+                |p| TileStyle {
+                    dim: dim(p),
+                    ..Default::default()
+                },
+                |_, _, _| {},
+            );
         }
     }
 }
@@ -259,7 +285,7 @@ impl MergeState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         ui.horizontal(|ui| {
             if ui.button(labeled(I_ADD, "Add PDFs…")).clicked() {
                 self.add(pick_files("PDF", PDF_EXT));
@@ -283,33 +309,43 @@ impl MergeState {
         let mut i = 0;
         while i < self.items.len() {
             let removed = card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(secondary(ui, format!("{:>2}", i + 1)));
-                    ui.label(RichText::new(I_DOCUMENT).size(18.0));
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(file_name(&self.items[i].0));
-                        caption(
-                            ui,
-                            &format!(
-                                "{} pages · {}",
-                                self.items[i].1,
-                                file_size(&self.items[i].0)
-                            ),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let removed = row_controls(ui, &mut self.items, i);
-                        if !removed {
-                            ui.add_space(8.0);
-                            pages_field(ui, &mut self.items[i].2, 120.0);
-                            ui.label(secondary(ui, "Pages"));
-                        }
-                        removed
+                let removed = ui
+                    .horizontal(|ui| {
+                        ui.label(secondary(ui, format!("{:>2}", i + 1)));
+                        ui.label(RichText::new(I_DOCUMENT).size(18.0));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(file_name(&self.items[i].0));
+                            caption(
+                                ui,
+                                &format!(
+                                    "{} pages · {}",
+                                    self.items[i].1,
+                                    file_size(&self.items[i].0)
+                                ),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let removed = row_controls(ui, &mut self.items, i);
+                            if !removed {
+                                ui.add_space(8.0);
+                                pages_field(ui, &mut self.items[i].2, 120.0);
+                                ui.label(secondary(ui, "Pages"));
+                            }
+                            removed
+                        })
+                        .inner
                     })
-                    .inner
-                })
-                .inner
+                    .inner;
+                if !removed && self.items[i].1 > 0 {
+                    let (path, n, spec) = (&self.items[i].0, self.items[i].1, &self.items[i].2);
+                    let sel = selected_pages(spec, n);
+                    ui.add_space(8.0);
+                    page_strip(ui, thumbs, path, n, |p| {
+                        sel.as_ref().is_some_and(|s| !s.contains(&p))
+                    });
+                }
+                removed
             });
             if !removed {
                 i += 1;
@@ -366,9 +402,9 @@ impl Default for SplitState {
 }
 
 impl SplitState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
         section(ui, "Split method");
         card(ui, |ui| {
             ui.radio_value(
@@ -423,6 +459,57 @@ impl SplitState {
             return task("Splitting", move || {
                 pdf::assemble::split(&path, mode, n, &spec, &dir)
             });
+        }
+        if let Some(path) = self.src.path.clone() {
+            let total = self.src.pages;
+            // Which output file each page goes to (None = not included).
+            let groups: Option<Vec<Option<usize>>> = match self.mode {
+                SplitMode::EveryPage => Some((0..total as usize).map(Some).collect()),
+                SplitMode::EveryN => {
+                    let n = self.every.max(1) as usize;
+                    Some((0..total as usize).map(|i| Some(i / n)).collect())
+                }
+                SplitMode::Ranges => pdf::parse_ranges(&self.spec, total).ok().map(|ranges| {
+                    (1..=total)
+                        .map(|p| {
+                            ranges
+                                .iter()
+                                .position(|&(a, b)| (a.min(b)..=a.max(b)).contains(&p))
+                        })
+                        .collect()
+                }),
+                SplitMode::Extract => selected_pages(&self.spec, total)
+                    .map(|sel| (1..=total).map(|p| sel.contains(&p).then_some(0)).collect()),
+            };
+            let extract = self.mode == SplitMode::Extract;
+            pages_header(ui, total);
+            page_grid(
+                ui,
+                thumbs,
+                &path,
+                total,
+                |p| match &groups {
+                    None => TileStyle::default(),
+                    Some(g) => match g[(p - 1) as usize] {
+                        None => TileStyle {
+                            dim: true,
+                            ..Default::default()
+                        },
+                        Some(_) if extract => TileStyle {
+                            highlight: true,
+                            ..Default::default()
+                        },
+                        Some(k) => TileStyle {
+                            badge: Some((
+                                format!("File {}", k + 1),
+                                SOURCE_COLORS[k % SOURCE_COLORS.len()],
+                            )),
+                            ..Default::default()
+                        },
+                    },
+                },
+                |_, _, _| {},
+            );
         }
         None
     }
@@ -524,7 +611,7 @@ impl OrganizeState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         let p = Palette::current(ui);
         let any = !self.tiles.is_empty();
         let nsel = self.tiles.iter().filter(|t| t.selected).count();
@@ -628,7 +715,7 @@ impl OrganizeState {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - footer_h).max(120.0))
-                    .show(ui, |ui| self.grid(ui));
+                    .show(ui, |ui| self.grid(ui, thumbs));
             });
 
         ui.add_space(12.0);
@@ -651,13 +738,13 @@ impl OrganizeState {
             ui.add_space(8.0);
             caption(
                 ui,
-                "Click to select. Ctrl+click adds a page, Shift+click selects a range.",
+                "Click to select (Ctrl / Shift for several). Double-click a page to view it full size.",
             );
         });
         action
     }
 
-    fn grid(&mut self, ui: &mut egui::Ui) {
+    fn grid(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) {
         let p = Palette::current(ui);
         if self.tiles.is_empty() {
             ui.add_space(60.0);
@@ -680,6 +767,7 @@ impl OrganizeState {
         let tile = Vec2::new(120.0, 164.0) * self.zoom;
         let modifiers = ui.input(|i| i.modifiers);
         let mut clicked = None;
+        let mut view = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(14.0);
             for (i, t) in self.tiles.iter().enumerate() {
@@ -692,57 +780,35 @@ impl OrganizeState {
                 } else if resp.hovered() {
                     painter.rect_filled(rect, 8.0, p.card_hover);
                 }
-                // Page outline with the right aspect ratio after rotation.
-                let (mut w, mut h) = self.sizes[t.r.source]
-                    .get(t.r.page as usize - 1)
-                    .copied()
-                    .unwrap_or((595.0, 842.0));
-                if t.r.rotate % 180 != 0 {
-                    std::mem::swap(&mut w, &mut h);
-                }
-                let area = Vec2::new(tile.x - 28.0, tile.y - 48.0);
-                let s = (area.x / w).min(area.y / h);
-                let page = egui::Rect::from_center_size(
-                    rect.center_top() + Vec2::new(0.0, 12.0 + area.y / 2.0),
-                    Vec2::new(w * s, h * s),
+                // Real page thumbnail, shown with the tile's rotation.
+                let area = Rect::from_min_max(
+                    rect.min + Vec2::new(12.0, 12.0),
+                    rect.max - Vec2::new(12.0, 30.0),
                 );
+                let page = thumbs.paint_page(
+                    ui,
+                    &self.sources[t.r.source],
+                    t.r.page,
+                    THUMB,
+                    t.r.rotate,
+                    area,
+                );
+                let painter = ui.painter();
                 painter.rect_filled(
-                    page.translate(Vec2::new(0.0, 2.0)),
-                    3.0,
-                    Color32::from_black_alpha(50),
-                );
-                painter.rect_filled(page, 3.0, Color32::WHITE);
-                painter.rect_stroke(
-                    page,
-                    3.0,
-                    Stroke::new(1.0, Color32::from_gray(210)),
-                    StrokeKind::Inside,
-                );
-                painter.rect_filled(
-                    egui::Rect::from_min_size(page.min, Vec2::new(page.width(), 3.0)),
-                    egui::CornerRadius {
-                        nw: 3,
-                        ne: 3,
-                        sw: 0,
-                        se: 0,
-                    },
+                    Rect::from_min_size(page.min, Vec2::new(page.width(), 3.0)),
+                    0.0,
                     color,
                 );
-                painter.text(
-                    page.center(),
-                    Align2::CENTER_CENTER,
-                    t.r.page.to_string(),
-                    FontId::new(22.0 * self.zoom, semibold()),
-                    Color32::from_gray(110),
-                );
                 if t.r.rotate != 0 {
-                    painter.text(
-                        page.right_bottom() - Vec2::new(5.0, 4.0),
-                        Align2::RIGHT_BOTTOM,
-                        format!("{}°", t.r.rotate),
-                        FontId::proportional(11.0),
-                        Color32::from_rgb(0x00, 0x5F, 0xB8),
+                    let label = format!("{}°", t.r.rotate);
+                    let galley =
+                        painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::WHITE);
+                    let r = Rect::from_min_size(
+                        page.right_bottom() - galley.size() - Vec2::new(14.0, 8.0),
+                        galley.size() + Vec2::new(10.0, 4.0),
                     );
+                    painter.rect_filled(r, 4.0, p.accent.gamma_multiply(0.9));
+                    painter.galley(r.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE);
                 }
                 painter.text(
                     rect.center_bottom() - Vec2::new(0.0, 10.0),
@@ -751,7 +817,9 @@ impl OrganizeState {
                     FontId::proportional(12.0),
                     if t.selected { p.accent } else { p.text2 },
                 );
-                if resp.clicked() {
+                if resp.double_clicked() {
+                    view = Some(i);
+                } else if resp.clicked() {
                     clicked = Some(i);
                 }
                 resp.on_hover_text(format!(
@@ -761,7 +829,18 @@ impl OrganizeState {
                 ));
             }
         });
-        if let Some(i) = clicked {
+        if let Some(i) = view {
+            let items = self
+                .tiles
+                .iter()
+                .map(|t| ViewItem {
+                    path: self.sources[t.r.source].clone(),
+                    page: t.r.page,
+                    rotate: t.r.rotate,
+                })
+                .collect();
+            thumbs.open_viewer(items, i);
+        } else if let Some(i) = clicked {
             if modifiers.shift {
                 let anchor = self.tiles.iter().position(|t| t.selected).unwrap_or(i);
                 let (a, b) = (anchor.min(i), anchor.max(i));
@@ -791,9 +870,9 @@ pub struct CompressState {
 }
 
 impl CompressState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
 
         section(ui, "Compression level");
         card(ui, |ui| {
@@ -902,6 +981,7 @@ impl CompressState {
                 pdf::compress::compress_file(&path, &out, &opts)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -931,7 +1011,7 @@ impl ImagesState {
             .extend(paths.into_iter().filter(|p| has_ext(p, IMG_EXT)));
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _thumbs: &mut Thumbs) -> Option<Task> {
         ui.horizontal(|ui| {
             if ui.button(labeled(I_ADD, "Add images…")).clicked() {
                 self.add(pick_files("Images", IMG_EXT));
@@ -1123,9 +1203,9 @@ impl LinksState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        if self.src.ui(ui) {
+        if self.src.ui(ui, thumbs) {
             self.load();
         }
         if let Some(e) = &self.error {
@@ -1281,6 +1361,60 @@ impl LinksState {
                 pdf::links::apply(&path, &out, &removing, &add)
             });
         }
+        if let Some(path) = self.src.path.clone() {
+            let p = Palette::current(ui);
+            let sizes = &self.sizes;
+            let existing = &self.existing;
+            let drafts = &self.drafts;
+            pages_header(ui, self.src.pages);
+            caption(
+                ui,
+                "Red boxes are existing links (faded when marked for removal); blue boxes are new links.",
+            );
+            page_grid(
+                ui,
+                thumbs,
+                &path,
+                self.src.pages,
+                |_| TileStyle::default(),
+                |painter, page, shown| {
+                    let Some(&(pw, ph)) = sizes.get(page as usize - 1) else {
+                        return;
+                    };
+                    let to_screen = |r: &LinkRect| {
+                        Rect::from_min_size(
+                            shown.min
+                                + Vec2::new(r.x / pw * shown.width(), r.y / ph * shown.height()),
+                            Vec2::new(r.w / pw * shown.width(), r.h / ph * shown.height()),
+                        )
+                    };
+                    let red = Color32::from_rgb(0xE8, 0x11, 0x23);
+                    for (l, remove) in existing.iter().filter(|(l, _)| l.rect.page == page) {
+                        let c = if *remove {
+                            red.gamma_multiply(0.3)
+                        } else {
+                            red
+                        };
+                        painter.rect(
+                            to_screen(&l.rect),
+                            1.0,
+                            c.gamma_multiply(0.15),
+                            Stroke::new(1.5, c),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    for d in drafts.iter().filter(|d| d.rect.page == page) {
+                        painter.rect(
+                            to_screen(&d.rect),
+                            1.0,
+                            p.accent.gamma_multiply(0.25),
+                            Stroke::new(1.5, p.accent),
+                            StrokeKind::Inside,
+                        );
+                    }
+                },
+            );
+        }
         None
     }
 }
@@ -1312,9 +1446,9 @@ impl MetaState {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        if self.src.ui(ui) {
+        if self.src.ui(ui, thumbs) {
             self.load();
         }
         if let Some(e) = &self.error {
@@ -1377,6 +1511,7 @@ impl MetaState {
                 pdf::meta::write_info(&path, &out, &fields)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -1392,9 +1527,9 @@ pub struct TextState {
 }
 
 impl TextState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
         section(ui, "Options");
         setting(ui, I_DOCUMENT, "Pages", "Examples: 1-3, 5, 8-end", |ui| {
             pages_field(ui, &mut self.range, 180.0);
@@ -1411,6 +1546,10 @@ impl TextState {
                 pdf::meta::extract_text(&path, &out, &range)
             });
         }
+        let sel = selected_pages(&self.range, self.src.pages);
+        self.src.preview(ui, thumbs, |p| {
+            sel.as_ref().is_some_and(|s| !s.contains(&p))
+        });
         None
     }
 }
@@ -1429,9 +1568,9 @@ pub struct ProtectState {
 }
 
 impl ProtectState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
-        self.src.ui(ui);
+        self.src.ui(ui, thumbs);
 
         section(ui, "Passwords");
         card(ui, |ui| {
@@ -1507,6 +1646,7 @@ impl ProtectState {
                 pdf::meta::protect(&path, &out, &u, &o, a)
             });
         }
+        self.src.preview(ui, thumbs, |_| false);
         None
     }
 }
@@ -1518,7 +1658,7 @@ pub struct UnlockState {
 }
 
 impl UnlockState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Task> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _thumbs: &mut Thumbs) -> Option<Task> {
         section(ui, "Source");
         let (name, info) = match &self.path {
             Some(p) => (file_name(p), file_size(p)),

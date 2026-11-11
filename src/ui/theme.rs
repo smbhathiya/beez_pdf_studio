@@ -40,6 +40,7 @@ pub const I_CHECK: &str = "\u{E73E}";
 pub const I_ERROR: &str = "\u{E783}";
 pub const I_DOCUMENT: &str = "\u{E8A5}";
 pub const I_CLEAR: &str = "\u{E894}";
+pub const I_REMOVE: &str = "\u{E738}";
 
 pub fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())

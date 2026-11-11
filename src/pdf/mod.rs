@@ -6,6 +6,7 @@ pub mod compress;
 pub mod images;
 pub mod links;
 pub mod meta;
+pub mod render;
 
 use std::fs::File;
 use std::io::BufWriter;

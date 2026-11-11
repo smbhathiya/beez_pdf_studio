@@ -1,6 +1,7 @@
 //! Application shell: Home (tool launcher) → full-window tool pages with a back button,
 //! a Windows 11 style InfoBar for results, and background task handling.
 
+mod preview;
 mod theme;
 mod tools;
 mod update;
@@ -13,6 +14,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 
+use preview::Thumbs;
 use theme::*;
 use tools::*;
 use update::UpdateUi;
@@ -39,6 +41,8 @@ pub struct App {
     protect: ProtectState,
     unlock: UnlockState,
     update: UpdateUi,
+    /// Page thumbnails and the full-size page viewer, shared by all tools.
+    thumbs: Thumbs,
 }
 
 impl App {
@@ -60,6 +64,7 @@ impl App {
             protect: Default::default(),
             unlock: Default::default(),
             update: UpdateUi::new(&cc.egui_ctx),
+            thumbs: Thumbs::default(),
         };
         // Files passed on the command line (e.g. "Open with…").
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -98,6 +103,10 @@ impl App {
 
     /// Route opened/dropped files to a tool. On Home, the file type picks the tool.
     fn open_files(&mut self, tool: Option<Tool>, files: Vec<PathBuf>) {
+        // Re-opened files may have changed on disk: drop their old previews.
+        for f in &files {
+            self.thumbs.invalidate(f);
+        }
         let pdfs: Vec<PathBuf> = files
             .iter()
             .filter(|p| has_ext(p, PDF_EXT))
@@ -258,16 +267,16 @@ impl App {
         ui.add_space(12.0);
 
         let body = |app: &mut Self, ui: &mut egui::Ui| match tool {
-            Tool::Organize => app.organize.ui(ui),
-            Tool::Merge => app.merge.ui(ui),
-            Tool::Split => app.split.ui(ui),
-            Tool::Compress => app.compress.ui(ui),
-            Tool::ImagesToPdf => app.images.ui(ui),
-            Tool::Links => app.links.ui(ui),
-            Tool::Metadata => app.meta.ui(ui),
-            Tool::ExtractText => app.text.ui(ui),
-            Tool::Protect => app.protect.ui(ui),
-            Tool::Unlock => app.unlock.ui(ui),
+            Tool::Organize => app.organize.ui(ui, &mut app.thumbs),
+            Tool::Merge => app.merge.ui(ui, &mut app.thumbs),
+            Tool::Split => app.split.ui(ui, &mut app.thumbs),
+            Tool::Compress => app.compress.ui(ui, &mut app.thumbs),
+            Tool::ImagesToPdf => app.images.ui(ui, &mut app.thumbs),
+            Tool::Links => app.links.ui(ui, &mut app.thumbs),
+            Tool::Metadata => app.meta.ui(ui, &mut app.thumbs),
+            Tool::ExtractText => app.text.ui(ui, &mut app.thumbs),
+            Tool::Protect => app.protect.ui(ui, &mut app.thumbs),
+            Tool::Unlock => app.unlock.ui(ui, &mut app.thumbs),
         };
         // Tools are disabled while a task runs or while an update is being installed.
         let busy = self.running.is_some() || self.update.busy();
@@ -448,6 +457,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         self.update.poll();
+        self.thumbs.poll(ui.ctx());
         let ctx = ui.ctx().clone();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -461,8 +471,10 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             self.open_files(self.tool, dropped);
         }
+        // Esc goes back to Home (unless it is closing the page viewer).
         if self.tool.is_some()
             && self.running.is_none()
+            && !self.thumbs.viewer_open()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.tool = None;
@@ -518,6 +530,8 @@ impl eframe::App for App {
                 p.accent,
             );
         }
+
+        self.thumbs.show_viewer(&ctx);
 
         if let Some(t) = action {
             self.start(&ctx, t);
