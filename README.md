@@ -1,4 +1,4 @@
-# 🐝 UtilBee PDF Studio
+# 🐝 Beez PDF Studio
 
 A fast desktop app for working with PDFs, written in Rust. Everything runs on your own computer and no files are uploaded.
 
@@ -152,7 +152,7 @@ opt-level = 3
 
 - **Icon:** [`assets/icon.ico`](assets/icon.ico) is embedded into `util_bee.exe` by [`build.rs`](build.rs) (Explorer, taskbar, Start menu, Task Manager), together with the product name and publisher (**Beez**). To redesign it, edit [`examples/make_icon.rs`](examples/make_icon.rs) and run `cargo run --example make_icon`.
 - **Installer:** [`installer/utilbee.iss`](installer/utilbee.iss) is an [Inno Setup](https://jrsoftware.org/isinfo.php) script. The installer:
-  - installs for the current user into `%LOCALAPPDATA%\Programs\UtilBee PDF Studio`, so no administrator rights are needed and self-update keeps working,
+  - installs for the current user into `%LOCALAPPDATA%\Programs\Beez PDF Studio`, so no administrator rights are needed and self-update keeps working,
   - adds a Start menu shortcut, and optionally a Desktop shortcut and an **Open with** entry for PDF files,
   - registers an uninstaller under *Settings → Apps*,
   - upgrades an existing installation in place.
@@ -162,7 +162,7 @@ Build the installer locally (requires Inno Setup 6):
 ```powershell
 cargo build --release
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.1 installer\utilbee.iss
-# → dist\UtilBee-PDF-Studio-Setup-v0.1.1.exe
+# → dist\Beez-PDF-Studio-Setup-v0.1.1.exe
 ```
 
 The release workflow builds and attaches it automatically.
@@ -200,8 +200,8 @@ On the repository's **Actions** tab, the *Release* workflow:
 
 1. runs the tests,
 2. builds `util_bee.exe` on Windows,
-3. zips it as `UtilBee-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
-4. builds the installer `UtilBee-PDF-Studio-Setup-v0.2.0.exe` with Inno Setup,
+3. zips it as `Beez-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
+4. builds the installer `Beez-PDF-Studio-Setup-v0.2.0.exe` with Inno Setup,
 5. creates the GitHub Release with download notes and both files attached.
 
 When the workflow finishes, installed apps offer the update the next time they start (see [Auto-update](#7-auto-update)).
@@ -212,8 +212,8 @@ To publish by hand, the asset name and zip layout must match what the updater ex
 
 ```powershell
 $v = "0.2.0"
-Compress-Archive -Path target\release\util_bee.exe -DestinationPath "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" -Force
-gh release create "v$v" "UtilBee-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --title "UtilBee PDF Studio v$v" --generate-notes
+Compress-Archive -Path target\release\util_bee.exe -DestinationPath "Beez-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" -Force
+gh release create "v$v" "Beez-PDF-Studio-v$v-x86_64-pc-windows-msvc.zip" --title "Beez PDF Studio v$v" --generate-notes
 ```
 
 - The file name must contain `x86_64-pc-windows-msvc`.

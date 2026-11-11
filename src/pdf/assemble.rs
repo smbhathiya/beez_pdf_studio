@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use lopdf::{Dictionary, Document, Object, ObjectId, dictionary};
 
+use super::progress::Progress;
 use super::{expand_ranges, inherited, load, page_count, parse_ranges, save};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,13 +151,21 @@ pub struct MergeItem {
     pub ranges: String,
 }
 
-pub fn merge(items: &[MergeItem], output: &Path) -> Result<String> {
+pub fn merge(items: &[MergeItem], output: &Path, pr: &Progress) -> Result<String> {
     if items.is_empty() {
         bail!("Add at least one PDF");
     }
     let mut docs = Vec::new();
     let mut refs = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        pr.check()?;
+        pr.step(
+            0.0,
+            0.6,
+            i,
+            items.len(),
+            format!("Reading file {} of {}", i + 1, items.len()),
+        );
         let doc = load(&item.path)?;
         let ranges = parse_ranges(&item.ranges, page_count(&doc))?;
         refs.extend(expand_ranges(&ranges).into_iter().map(|page| PageRef {
@@ -166,9 +175,16 @@ pub fn merge(items: &[MergeItem], output: &Path) -> Result<String> {
         }));
         docs.push(doc);
     }
+    pr.check()?;
+    pr.set(0.65, format!("Combining {} pages", refs.len()));
     let mut out = assemble(&docs, &refs)?;
+    pr.check()?;
+    pr.set(0.8, "Compressing");
     out.compress();
+    pr.check()?;
+    pr.set(0.9, "Saving");
     save(&mut out, output)?;
+    pr.set(1.0, "Done");
     Ok(format!(
         "Merged {} files ({} pages) → {}",
         items.len(),
@@ -189,7 +205,15 @@ pub enum SplitMode {
     Extract,
 }
 
-pub fn split(input: &Path, mode: SplitMode, n: u32, spec: &str, out_dir: &Path) -> Result<String> {
+pub fn split(
+    input: &Path,
+    mode: SplitMode,
+    n: u32,
+    spec: &str,
+    out_dir: &Path,
+    pr: &Progress,
+) -> Result<String> {
+    pr.set(0.0, "Reading the PDF");
     let doc = load(input)?;
     let total = page_count(&doc);
     let stem = input
@@ -215,8 +239,22 @@ pub fn split(input: &Path, mode: SplitMode, n: u32, spec: &str, out_dir: &Path) 
     };
 
     let sources = [doc];
-    let mut written = 0;
+    let mut written: Vec<PathBuf> = Vec::new();
     for (i, group) in groups.iter().enumerate() {
+        if pr.is_cancelled() {
+            // Don't leave a half-finished set of files behind.
+            for f in &written {
+                let _ = std::fs::remove_file(f);
+            }
+            pr.check()?;
+        }
+        pr.step(
+            0.05,
+            1.0,
+            i,
+            groups.len(),
+            format!("Writing file {} of {}", i + 1, groups.len()),
+        );
         let name = match (mode, group.as_slice()) {
             (SplitMode::Extract, _) => format!("{stem}_extracted.pdf"),
             (_, [only]) => format!("{stem}_page{only}.pdf"),
@@ -233,21 +271,47 @@ pub fn split(input: &Path, mode: SplitMode, n: u32, spec: &str, out_dir: &Path) 
             .collect();
         let mut out = assemble(&sources, &refs)?;
         out.compress();
-        save(&mut out, &out_dir.join(name))?;
-        written += 1;
+        let path = out_dir.join(name);
+        save(&mut out, &path)?;
+        written.push(path);
     }
+    pr.set(1.0, "Done");
     Ok(format!(
-        "Created {written} file(s) in {}",
+        "Created {} file(s) in {}",
+        written.len(),
         out_dir.display()
     ))
 }
 
 /// Write a document built from an arbitrary page arrangement (Organize tool).
-pub fn organize(paths: &[PathBuf], pages: &[PageRef], output: &Path) -> Result<String> {
-    let docs = paths.iter().map(|p| load(p)).collect::<Result<Vec<_>>>()?;
+pub fn organize(
+    paths: &[PathBuf],
+    pages: &[PageRef],
+    output: &Path,
+    pr: &Progress,
+) -> Result<String> {
+    let mut docs = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        pr.check()?;
+        pr.step(
+            0.0,
+            0.6,
+            i,
+            paths.len(),
+            format!("Reading file {} of {}", i + 1, paths.len()),
+        );
+        docs.push(load(p)?);
+    }
+    pr.check()?;
+    pr.set(0.65, format!("Arranging {} pages", pages.len()));
     let mut out = assemble(&docs, pages)?;
+    pr.check()?;
+    pr.set(0.8, "Compressing");
     out.compress();
+    pr.check()?;
+    pr.set(0.9, "Saving");
     save(&mut out, output)?;
+    pr.set(1.0, "Done");
     Ok(format!(
         "Saved {} pages → {}",
         pages.len(),

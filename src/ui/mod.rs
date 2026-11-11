@@ -14,6 +14,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 
+use crate::pdf::progress::{Progress, is_cancelled};
 use preview::Thumbs;
 use theme::*;
 use tools::*;
@@ -22,6 +23,17 @@ use update::UpdateUi;
 struct Running {
     label: String,
     rx: mpsc::Receiver<Result<String>>,
+    /// Shared with the task: progress reports flow in, the cancel request flows out.
+    progress: Progress,
+    started: std::time::Instant,
+}
+
+/// How the last task ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    Failed,
+    Cancelled,
 }
 
 pub struct App {
@@ -29,7 +41,7 @@ pub struct App {
     tool: Option<Tool>,
     running: Option<Running>,
     /// Last result: (success, message).
-    status: Option<(bool, String)>,
+    status: Option<(Outcome, String)>,
     merge: MergeState,
     split: SplitState,
     organize: OrganizeState,
@@ -77,24 +89,36 @@ impl App {
     fn start(&mut self, ctx: &egui::Context, (label, job): Task) {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
+        let progress = Progress::default();
+        let task_progress = progress.clone();
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("Unexpected internal error")));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&task_progress)))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Unexpected internal error")));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
         self.status = None;
-        self.running = Some(Running { label, rx });
+        self.running = Some(Running {
+            label,
+            rx,
+            progress,
+            started: std::time::Instant::now(),
+        });
     }
 
     fn poll(&mut self) {
         let Some(r) = &self.running else { return };
         let result = match r.rx.try_recv() {
-            Ok(Ok(msg)) => (true, msg),
-            Ok(Err(e)) => (false, format!("{e:#}")),
+            Ok(Ok(msg)) => (Outcome::Done, msg),
+            Ok(Err(e)) if is_cancelled(&e) => (
+                Outcome::Cancelled,
+                "The operation was cancelled. Nothing was saved.".to_string(),
+            ),
+            Ok(Err(e)) => (Outcome::Failed, format!("{e:#}")),
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                (false, "The task stopped unexpectedly".into())
+                (Outcome::Failed, "The task stopped unexpectedly".into())
             }
         };
         self.status = Some(result);
@@ -306,26 +330,72 @@ impl App {
     fn info_bar(&mut self, ui: &mut egui::Ui) {
         let p = Palette::current(ui);
         if let Some(r) = &self.running {
+            let pr = r.progress.clone();
+            let cancelling = pr.is_cancelled();
+            let elapsed = r.started.elapsed().as_secs();
+            let fraction = pr.fraction();
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(strong(format!("{}…", r.label)));
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let title = if cancelling {
+                            "Cancelling…".to_string()
+                        } else {
+                            format!("{}…", r.label)
+                        };
+                        ui.label(strong(title));
+                        let stage = pr.stage();
+                        let mut detail = if stage.is_empty() {
+                            "Starting".to_string()
+                        } else {
+                            stage
+                        };
+                        if let Some(f) = fraction {
+                            detail = format!("{:.0}%  ·  {detail}", f * 100.0);
+                        }
+                        detail.push_str(&format!(
+                            "  ·  {}:{:02} elapsed",
+                            elapsed / 60,
+                            elapsed % 60
+                        ));
+                        caption(ui, &detail);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(labeled(I_CLOSE, "Cancel"))
+                            .min_size(Vec2::new(100.0, 32.0));
+                        if ui
+                            .add_enabled(!cancelling, btn)
+                            .on_hover_text("Stop now. Nothing is saved.")
+                            .clicked()
+                        {
+                            pr.cancel();
+                        }
+                    });
                 });
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .animate(true)
-                        .desired_height(4.0),
-                );
+                ui.add_space(6.0);
+                let bar = match fraction {
+                    // Real progress when the task reports it…
+                    Some(f) => egui::ProgressBar::new(f),
+                    // …otherwise an animated "working" bar.
+                    None => egui::ProgressBar::new(((ui.input(|i| i.time) * 0.6) % 1.0) as f32),
+                };
+                ui.add(bar.desired_height(6.0).fill(p.accent).corner_radius(3.0));
             });
+            // Keep the elapsed time and the bar moving.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
-        let Some((ok, msg)) = self.status.clone() else {
+        let Some((outcome, msg)) = self.status.clone() else {
             return;
         };
-        let (bg, fg, icon, head) = if ok {
-            (p.success_bg, p.success, I_CHECK, "Done")
-        } else {
-            (p.error_bg, p.error, I_ERROR, "Something went wrong")
+        let ok = outcome == Outcome::Done;
+        let (bg, fg, icon, head) = match outcome {
+            Outcome::Done => (p.success_bg, p.success, I_CHECK, "Done"),
+            Outcome::Failed => (p.error_bg, p.error, I_ERROR, "Something went wrong"),
+            Outcome::Cancelled => (p.card, p.text2, I_INFO, "Cancelled"),
         };
         let mut close = false;
         egui::Frame::new()

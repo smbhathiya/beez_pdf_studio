@@ -3,8 +3,8 @@
 #   git tag v0.2.0 && git push origin v0.2.0
 #
 # Release assets:
-#   * UtilBee-PDF-Studio-Setup-vX.Y.Z.exe — the installer for new users.
-#   * UtilBee-PDF-Studio-vX.Y.Z-x86_64-pc-windows-msvc.zip — the portable app. Its name contains
+#   * Beez-PDF-Studio-Setup-vX.Y.Z.exe — the installer for new users.
+#   * Beez-PDF-Studio-vX.Y.Z-x86_64-pc-windows-msvc.zip — the portable app. Its name contains
 #     the target triple and it holds `util_bee.exe`, which is what the in-app updater
 #     (src/updater.rs) downloads. The installer's name must NOT contain the target triple.
 
@@ -45,7 +45,7 @@ jobs:
       - name: Package portable zip
         shell: pwsh
         run: |
-          $zip = "UtilBee-PDF-Studio-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+          $zip = "Beez-PDF-Studio-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
           Compress-Archive -Path target/release/util_bee.exe -DestinationPath $zip
           "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -60,7 +60,7 @@ jobs:
           if (-not $iscc) { throw "Inno Setup compiler not found" }
           & $iscc "/DAppVersion=$env:VERSION" installer/utilbee.iss
           if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
-          "SETUP=dist/UtilBee-PDF-Studio-Setup-v$env:VERSION.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SETUP=dist/Beez-PDF-Studio-Setup-v$env:VERSION.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Publish release
         shell: pwsh
@@ -70,12 +70,12 @@ jobs:
           $notes = @"
           ## Download
 
-          - **New install:** download ``UtilBee-PDF-Studio-Setup-v$env:VERSION.exe``, run it and follow the steps. No administrator rights are needed.
+          - **New install:** download ``Beez-PDF-Studio-Setup-v$env:VERSION.exe``, run it and follow the steps. No administrator rights are needed.
           - **Portable:** download the ``.zip``, extract it and run ``util_bee.exe``.
           - **Already installed?** The app updates itself: open it and click **Update now**.
 
           "@
           gh release create "${{ github.ref_name }}" "$env:SETUP" "$env:ZIP" `
-            --title "UtilBee PDF Studio ${{ github.ref_name }}" `
+            --title "Beez PDF Studio ${{ github.ref_name }}" `
             --notes "$notes" `
             --generate-notes

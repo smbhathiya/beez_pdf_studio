@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use lopdf::{Document, Object, dictionary};
 
+use super::progress::Progress;
 use super::{VisualFrame, decode_text_string, load, num, page_count, page_id, save};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,8 +145,12 @@ pub fn apply(
     output: &Path,
     remove: &[(u32, usize)],
     add: &[NewLink],
+    pr: &Progress,
 ) -> Result<String> {
+    pr.set(0.0, "Reading the PDF");
     let mut doc = load(input)?;
+    pr.check()?;
+    pr.set(0.5, "Updating links");
     let total = page_count(&doc);
     let remove: BTreeSet<_> = remove.iter().copied().collect();
 
@@ -202,7 +207,10 @@ pub fn apply(
         doc.get_dictionary_mut(pid)?.set("Annots", list);
     }
 
+    pr.check()?;
+    pr.set(0.8, "Saving");
     save(&mut doc, output)?;
+    pr.set(1.0, "Done");
     Ok(format!(
         "Removed {} and added {} link(s) → {}",
         remove.len(),
@@ -244,7 +252,7 @@ mod tests {
                 target: LinkTarget::Page(3),
             },
         ];
-        apply(&a, &b, &[], &add).unwrap();
+        apply(&a, &b, &[], &add, &Progress::default()).unwrap();
         let s = scan(&b).unwrap();
         assert_eq!(s.links.len(), 2);
         assert_eq!(s.links[0].target, "https://example.com");
@@ -254,7 +262,7 @@ mod tests {
             (r.x - 10.0).abs() < 0.01 && (r.y - 20.0).abs() < 0.01 && (r.w - 100.0).abs() < 0.01
         );
 
-        apply(&b, &c, &[(1, 0)], &[]).unwrap();
+        apply(&b, &c, &[(1, 0)], &[], &Progress::default()).unwrap();
         assert_eq!(scan(&c).unwrap().links.len(), 1);
     }
 }

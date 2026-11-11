@@ -1,8 +1,8 @@
-; Inno Setup script for UtilBee PDF Studio.
+; Inno Setup script for Beez PDF Studio.
 ;
 ; Build (after `cargo build --release`):
 ;   ISCC.exe /DAppVersion=0.1.1 installer\utilbee.iss
-; Output: dist\UtilBee-PDF-Studio-Setup-v<version>.exe
+; Output: dist\Beez-PDF-Studio-Setup-v<version>.exe
 ;
 ; Installs per user into %LOCALAPPDATA%\Programs (no administrator rights needed). This also
 ; keeps the in-app self-updater working, because the app can replace its own .exe there.
@@ -11,7 +11,7 @@
   #define AppVersion "0.0.0"
 #endif
 
-#define AppName "UtilBee PDF Studio"
+#define AppName "Beez PDF Studio"
 #define AppExe "util_bee.exe"
 #define AppUrl "https://github.com/smbhathiya/util_bee_pdf_studio"
 
@@ -36,7 +36,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=UtilBee-PDF-Studio-Setup-v{#AppVersion}
+OutputBaseFilename=Beez-PDF-Studio-Setup-v{#AppVersion}
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}

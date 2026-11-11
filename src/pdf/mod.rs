@@ -6,10 +6,11 @@ pub mod compress;
 pub mod images;
 pub mod links;
 pub mod meta;
+pub mod progress;
 pub mod render;
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,12 +30,36 @@ pub fn load(path: &Path) -> Result<Document> {
 
 /// Save a document using a classic cross-reference table (maximum compatibility).
 pub fn save(doc: &mut Document, path: &Path) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("Could not create {}", path.display()))?;
-    let mut w = BufWriter::new(file);
-    doc.save_to(&mut w)
-        .with_context(|| format!("Could not write {}", path.display()))?;
-    Ok(())
+    atomic_write(path, |w| {
+        doc.save_to(w)?;
+        Ok(())
+    })
+}
+
+/// Write bytes to `path` without ever leaving a half-written file behind.
+pub fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write(path, |w| Ok(w.write_all(bytes)?))
+}
+
+/// Write into `<path>.part` first and rename it over `path` only when everything succeeded.
+fn atomic_write(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>) -> Result<()> {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let result = (|| {
+        let file =
+            File::create(&part).with_context(|| format!("Could not create {}", path.display()))?;
+        let mut w = BufWriter::new(file);
+        write(&mut w).with_context(|| format!("Could not write {}", path.display()))?;
+        w.flush()
+            .with_context(|| format!("Could not write {}", path.display()))?;
+        drop(w);
+        std::fs::rename(&part, path).with_context(|| format!("Could not save {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
 }
 
 /// 1-based page number -> page object id.

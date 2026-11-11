@@ -152,7 +152,7 @@ impl UpdateUi {
                         });
                     }
                     State::Available(a) => {
-                        ui.label(format!("UtilBee PDF Studio {} is ready to install.", a.version));
+                        ui.label(format!("Beez PDF Studio {} is ready to install.", a.version));
                         ui.label(secondary(ui, format!("You have version {CURRENT_VERSION}.")));
                         ui.add_space(4.0);
                         caption(ui, "The update downloads in the background and takes effect after a restart.");
@@ -160,7 +160,10 @@ impl UpdateUi {
                     State::Installing { version, .. } => {
                         ui.label(format!("Downloading and installing version {version}…"));
                         ui.add_space(6.0);
-                        ui.add(egui::ProgressBar::new(0.0).animate(true).desired_height(4.0));
+                        // The download size is unknown, so show a moving "working" bar.
+                        let t = ((ui.input(|i| i.time) * 0.6) % 1.0) as f32;
+                        ui.add(egui::ProgressBar::new(t).desired_height(6.0).fill(p.accent).corner_radius(3.0));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
                     }
                     State::Installed(v) => {
                         ui.label(format!("Version {v} has been installed."));
@@ -238,7 +241,7 @@ impl UpdateUi {
         ui.horizontal(|ui| {
             caption(
                 ui,
-                &format!("UtilBee PDF Studio · Version {CURRENT_VERSION}"),
+                &format!("Beez PDF Studio · Version {CURRENT_VERSION}"),
             );
             let checking = matches!(
                 self.state,

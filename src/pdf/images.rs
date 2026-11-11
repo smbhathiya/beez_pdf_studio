@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression as Level, write::ZlibEncoder};
@@ -26,6 +27,7 @@ use image::{
 use lopdf::{Dictionary, Document, Object, Stream, dictionary};
 use rayon::prelude::*;
 
+use super::progress::Progress;
 use super::{human_size, save};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -493,14 +495,36 @@ fn encode_file(path: &Path, opts: &ImageOptions) -> Result<Encoded> {
 // PDF assembly
 // ---------------------------------------------------------------------------------------
 
-pub fn images_to_pdf(paths: &[PathBuf], opts: &ImageOptions, output: &Path) -> Result<String> {
+pub fn images_to_pdf(
+    paths: &[PathBuf],
+    opts: &ImageOptions,
+    output: &Path,
+    pr: &Progress,
+) -> Result<String> {
     if paths.is_empty() {
         bail!("Add at least one image");
     }
+    let total = paths.len();
+    let finished = AtomicUsize::new(0);
+    pr.set(0.0, format!("Optimising {total} image(s)"));
     let encoded: Vec<Encoded> = paths
         .par_iter()
-        .map(|p| encode_file(p, opts))
+        .map(|p| {
+            pr.check()?;
+            let e = encode_file(p, opts)?;
+            let k = finished.fetch_add(1, Ordering::Relaxed) + 1;
+            pr.step(
+                0.0,
+                0.9,
+                k,
+                total,
+                format!("Optimising image {k} of {total}"),
+            );
+            Ok(e)
+        })
         .collect::<Result<_>>()?;
+    pr.check()?;
+    pr.set(0.92, "Building the PDF");
 
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
@@ -555,7 +579,10 @@ pub fn images_to_pdf(paths: &[PathBuf], opts: &ImageOptions, output: &Path) -> R
     let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     doc.trailer.set("Root", catalog);
     doc.compress();
+    pr.check()?;
+    pr.set(0.96, "Saving");
     save(&mut doc, output)?;
+    pr.set(1.0, "Done");
 
     let source: usize = encoded.iter().map(|e| e.source_size).sum();
     let images: usize = encoded.iter().map(|e| e.pdf_size()).sum();
@@ -590,7 +617,13 @@ mod tests {
         img.save(&png).unwrap();
         DynamicImage::ImageRgba8(img).to_rgb8().save(&jpg).unwrap();
         let out = dir.join("out.pdf");
-        images_to_pdf(&[png, jpg.clone()], &ImageOptions::default(), &out).unwrap();
+        images_to_pdf(
+            &[png, jpg.clone()],
+            &ImageOptions::default(),
+            &out,
+            &Progress::default(),
+        )
+        .unwrap();
         let doc = Document::load(&out).unwrap();
         assert_eq!(doc.get_pages().len(), 2);
         assert_eq!(jpeg_info(&fs::read(&jpg).unwrap()), Some((40, 30, 3)));
@@ -600,7 +633,13 @@ mod tests {
             max_dimension: 20,
             ..Default::default()
         };
-        images_to_pdf(&[dir.join("a.png")], &lossy, &dir.join("lossy.pdf")).unwrap();
+        images_to_pdf(
+            &[dir.join("a.png")],
+            &lossy,
+            &dir.join("lossy.pdf"),
+            &Progress::default(),
+        )
+        .unwrap();
         assert!(Document::load(dir.join("lossy.pdf")).is_ok());
     }
 

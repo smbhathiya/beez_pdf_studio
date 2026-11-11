@@ -8,7 +8,7 @@
 //! produces exactly this):
 //!   * tag `vX.Y.Z` matching `version` in Cargo.toml,
 //!   * an asset whose name contains the target triple, e.g.
-//!     `UtilBee-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
+//!     `Beez-PDF-Studio-v0.2.0-x86_64-pc-windows-msvc.zip`,
 //!   * `util_bee.exe` at the root of that zip.
 
 use std::time::Duration;

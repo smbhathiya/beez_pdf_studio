@@ -25,7 +25,7 @@ fn window_icon() -> egui::IconData {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("UtilBee PDF Studio")
+            .with_title("Beez PDF Studio")
             .with_icon(window_icon())
             .with_inner_size([1200.0, 820.0])
             .with_min_inner_size([900.0, 600.0])
@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "UtilBee PDF Studio",
+        "Beez PDF Studio",
         options,
         Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
     )

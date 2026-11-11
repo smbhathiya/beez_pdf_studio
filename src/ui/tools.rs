@@ -19,17 +19,18 @@ use crate::pdf::{
     images::{ImageOptions, Orientation, PageSize, Quality},
     links::{ExistingLink, LinkRect, LinkTarget, NewLink},
     meta::{Allow, DocInfo, FIELDS},
+    progress::Progress,
 };
 
 pub const PDF_EXT: &[&str] = &["pdf"];
 pub const IMG_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
 /// Background work: a label for the progress bar and the job itself.
-pub type Task = (String, Box<dyn FnOnce() -> Result<String> + Send>);
+pub type Task = (String, Box<dyn FnOnce(&Progress) -> Result<String> + Send>);
 
 fn task(
     label: impl Into<String>,
-    f: impl FnOnce() -> Result<String> + Send + 'static,
+    f: impl FnOnce(&Progress) -> Result<String> + Send + 'static,
 ) -> Option<Task> {
     Some((label.into(), Box::new(f)))
 }
@@ -468,8 +469,8 @@ impl MergeState {
                     ranges: r.clone(),
                 })
                 .collect();
-            return task(format!("Merging {total} pages"), move || {
-                pdf::assemble::merge(&items, &out)
+            return task(format!("Merging {total} pages"), move |pr| {
+                pdf::assemble::merge(&items, &out, pr)
             });
         }
         None
@@ -553,8 +554,8 @@ impl SplitState {
                 dlg = dlg.set_directory(d);
             }
             let dir = dlg.pick_folder()?;
-            return task("Splitting", move || {
-                pdf::assemble::split(&path, mode, n, &spec, &dir)
+            return task("Splitting", move |pr| {
+                pdf::assemble::split(&path, mode, n, &spec, &dir, pr)
             });
         }
         if let Some(path) = self.src.path.clone() {
@@ -831,8 +832,8 @@ impl OrganizeState {
             ) {
                 let sources = self.sources.clone();
                 let pages: Vec<PageRef> = self.tiles.iter().map(|t| t.r).collect();
-                action = task("Saving organized PDF", move || {
-                    pdf::assemble::organize(&sources, &pages, &out)
+                action = task("Saving organized PDF", move |pr| {
+                    pdf::assemble::organize(&sources, &pages, &out, pr)
                 });
             }
             ui.add_space(8.0);
@@ -1299,8 +1300,8 @@ impl CompressState {
         if footer(ui, true, &labeled(I_SAVE, "Compress & save")) {
             let out = save_as(Some(&path), "compressed", "pdf")?;
             let opts = self.opts.clone();
-            return task("Compressing", move || {
-                pdf::compress::compress_file(&path, &out, &opts)
+            return task("Compressing", move |pr| {
+                pdf::compress::compress_file(&path, &out, &opts, pr)
             });
         }
         self.src.preview(ui, thumbs, |_| false);
@@ -1465,7 +1466,7 @@ impl ImagesState {
             let (imgs, opts) = (self.images.clone(), self.opts.clone());
             return task(
                 format!("Optimising and converting {n} image(s)"),
-                move || pdf::images::images_to_pdf(&imgs, &opts, &out),
+                move |pr| pdf::images::images_to_pdf(&imgs, &opts, &out, pr),
             );
         }
         if !self.images.is_empty() {
@@ -1677,8 +1678,8 @@ impl LinksState {
                     },
                 })
                 .collect();
-            return task("Saving links", move || {
-                pdf::links::apply(&path, &out, &removing, &add)
+            return task("Saving links", move |pr| {
+                pdf::links::apply(&path, &out, &removing, &add, pr)
             });
         }
         if let Some(path) = self.src.path.clone() {
@@ -1827,8 +1828,8 @@ impl MetaState {
         ) {
             let out = save_as(Some(&path), "edited", "pdf")?;
             let fields = self.fields.clone();
-            return task("Saving properties", move || {
-                pdf::meta::write_info(&path, &out, &fields)
+            return task("Saving properties", move |pr| {
+                pdf::meta::write_info(&path, &out, &fields, pr)
             });
         }
         self.src.preview(ui, thumbs, |_| false);
@@ -1862,8 +1863,8 @@ impl TextState {
         if footer(ui, true, &labeled(I_SAVE, "Extract to .txt")) {
             let out = save_as(Some(&path), "text", "txt")?;
             let range = self.range.clone();
-            return task("Extracting text", move || {
-                pdf::meta::extract_text(&path, &out, &range)
+            return task("Extracting text", move |pr| {
+                pdf::meta::extract_text(&path, &out, &range, pr)
             });
         }
         let sel = selected_pages(&self.range, self.src.pages);
@@ -1962,8 +1963,8 @@ impl ProtectState {
         if footer(ui, ok, &labeled(I_LOCK, "Protect & save")) {
             let out = save_as(Some(&path), "protected", "pdf")?;
             let (u, o, a) = (self.user.clone(), self.owner.clone(), self.allow);
-            return task("Encrypting", move || {
-                pdf::meta::protect(&path, &out, &u, &o, a)
+            return task("Encrypting", move |pr| {
+                pdf::meta::protect(&path, &out, &u, &o, a, pr)
             });
         }
         self.src.preview(ui, thumbs, |_| false);
@@ -2009,7 +2010,9 @@ impl UnlockState {
         if footer(ui, true, &labeled(I_UNLOCK, "Unlock & save")) {
             let out = save_as(Some(&path), "unlocked", "pdf")?;
             let pw = self.password.clone();
-            return task("Unlocking", move || pdf::meta::unlock(&path, &out, &pw));
+            return task("Unlocking", move |pr| {
+                pdf::meta::unlock(&path, &out, &pw, pr)
+            });
         }
         None
     }

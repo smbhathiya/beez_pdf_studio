@@ -8,8 +8,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico")
-            .set("ProductName", "UtilBee PDF Studio")
-            .set("FileDescription", "UtilBee PDF Studio")
+            .set("ProductName", "Beez PDF Studio")
+            .set("FileDescription", "Beez PDF Studio")
             .set("CompanyName", "Beez")
             .set("LegalCopyright", "© Beez")
             .set("OriginalFilename", "util_bee.exe");
