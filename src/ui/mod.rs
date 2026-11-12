@@ -514,15 +514,6 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             self.open_files(self.tool, dropped);
         }
-        // Esc goes back to Home (unless it is closing the page viewer).
-        if self.tool.is_some()
-            && self.running.is_none()
-            && !self.thumbs.viewer_open()
-            && !self.update.dialog_open()
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            self.tool = None;
-        }
 
         let bg = Palette::current(ui).bg;
         // Version + "Check for updates", pinned to the bottom of the Home screen.
@@ -583,6 +574,17 @@ impl eframe::App for App {
                 FontId::new(26.0, semibold()),
                 p.accent,
             );
+        }
+
+        // Esc goes back to Home. Checked after the tools ran, so a tool can use Esc first
+        // (e.g. to clear a selection); the page viewer and dialogs close on Esc themselves.
+        if self.tool.is_some()
+            && self.running.is_none()
+            && !self.thumbs.viewer_open()
+            && !self.update.dialog_open()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.tool = None;
         }
 
         self.thumbs.show_viewer(&ctx);

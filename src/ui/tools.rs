@@ -250,6 +250,7 @@ impl Source {
                 thumbs,
                 path,
                 self.pages,
+                None,
                 |p| TileStyle {
                     dim: dim(p),
                     ..Default::default()
@@ -521,6 +522,10 @@ pub struct SplitState {
     mode: SplitMode,
     every: u32,
     spec: String,
+    /// Pages picked with the mouse in the preview (Ranges / Extract modes).
+    sel: preview::PageSel,
+    /// The page-range text the selection was last synced with.
+    last_spec: String,
 }
 
 impl Default for SplitState {
@@ -530,6 +535,8 @@ impl Default for SplitState {
             mode: SplitMode::EveryPage,
             every: 2,
             spec: String::new(),
+            sel: Default::default(),
+            last_spec: String::new(),
         }
     }
 }
@@ -615,12 +622,28 @@ impl SplitState {
                     .map(|sel| (1..=total).map(|p| sel.contains(&p).then_some(0)).collect()),
             };
             let extract = self.mode == SplitMode::Extract;
+            // In Ranges / Extract mode pages can be picked with the mouse; the selection and
+            // the page-range text stay in sync both ways.
+            let selecting = matches!(self.mode, SplitMode::Ranges | SplitMode::Extract);
+            if selecting {
+                self.sel.selected.resize(total as usize, false);
+                if self.spec != self.last_spec {
+                    if self.spec.trim().is_empty() {
+                        self.sel.set_pages(&Default::default());
+                    } else if let Some(set) = selected_pages(&self.spec, total) {
+                        self.sel.set_pages(&set);
+                    }
+                    self.last_spec = self.spec.clone();
+                }
+            }
+            let before = self.sel.pages();
             pages_header(ui, total);
             page_grid(
                 ui,
                 thumbs,
                 &path,
                 total,
+                selecting.then_some(&mut self.sel),
                 |p| match &groups {
                     None => TileStyle::default(),
                     Some(g) => match g[(p - 1) as usize] {
@@ -643,6 +666,13 @@ impl SplitState {
                 },
                 |_, _, _| {},
             );
+            if selecting {
+                let after = self.sel.pages();
+                if after != before {
+                    self.spec = preview::ranges_text(&after);
+                    self.last_spec = self.spec.clone();
+                }
+            }
         }
         None
     }
@@ -667,6 +697,8 @@ pub struct OrganizeState {
     error: Option<String>,
     /// Tiles being dragged (indices into `tiles`), while a drag is in progress.
     drag: Option<Vec<usize>>,
+    /// Rubber-band selection: start point and the selection when it started.
+    marquee: Option<(egui::Pos2, Vec<bool>)>,
 }
 
 impl Default for OrganizeState {
@@ -678,6 +710,7 @@ impl Default for OrganizeState {
             zoom: 1.0,
             error: None,
             drag: None,
+            marquee: None,
         }
     }
 }
@@ -741,6 +774,19 @@ impl OrganizeState {
         }
     }
 
+    fn duplicate_selected(&mut self) {
+        let mut out = Vec::with_capacity(self.tiles.len() * 2);
+        for t in self.tiles.drain(..) {
+            let copy = t.selected.then(|| Tile {
+                selected: false,
+                ..t.clone()
+            });
+            out.push(t);
+            out.extend(copy);
+        }
+        self.tiles = out;
+    }
+
     fn rotate_selected(&mut self, by: i64) {
         for t in self.tiles.iter_mut().filter(|t| t.selected) {
             t.r.rotate = (t.r.rotate + by).rem_euclid(360);
@@ -792,16 +838,7 @@ impl OrganizeState {
                         self.move_selected(1);
                     }
                     if command(ui, has, I_COPY, "Duplicate") {
-                        let mut out = Vec::with_capacity(self.tiles.len() + nsel);
-                        for t in self.tiles.drain(..) {
-                            let copy = t.selected.then(|| Tile {
-                                selected: false,
-                                ..t.clone()
-                            });
-                            out.push(t);
-                            out.extend(copy);
-                        }
-                        self.tiles = out;
+                        self.duplicate_selected();
                     }
                     if command(ui, has, I_DELETE, "Delete") {
                         self.tiles.retain(|t| !t.selected);
@@ -874,7 +911,7 @@ impl OrganizeState {
             ui.add_space(8.0);
             caption(
                 ui,
-                "Drag pages to reorder, or onto the delete zone to remove them. Ctrl / Shift selects several; double-click to view a page.",
+                "Drag pages to reorder · drag on empty space to select · Ctrl+A all · Del delete · Ctrl+D duplicate · Ctrl+R / Ctrl+L rotate · double-click to view",
             );
         });
         action
@@ -904,6 +941,11 @@ impl OrganizeState {
         let mut drag_started = None;
         let mut rects = Vec::with_capacity(self.tiles.len());
         let dragging: Vec<usize> = self.drag.clone().unwrap_or_default();
+        let background = ui.interact(
+            clip,
+            ui.make_persistent_id("organizer_background"),
+            Sense::click_and_drag(),
+        );
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(14.0);
@@ -1119,13 +1161,84 @@ impl OrganizeState {
             self.drag = None;
         }
 
-        // The Delete key removes the selection.
-        if self.drag.is_none()
-            && nsel > 0
-            && !ui.ctx().egui_wants_keyboard_input()
-            && ui.input(|i| i.key_pressed(egui::Key::Delete))
+        // --- Rubber-band selection: drag on empty space -------------------------------
+        if background.drag_started()
+            && self.drag.is_none()
+            && let Some(start) = background.interact_pointer_pos()
         {
-            self.tiles.retain(|t| !t.selected);
+            let base = if modifiers.command || modifiers.shift {
+                self.tiles.iter().map(|t| t.selected).collect()
+            } else {
+                vec![false; self.tiles.len()]
+            };
+            self.marquee = Some((start, base));
+        }
+        if let Some((start, base)) = &self.marquee {
+            if let Some(pos) = pointer {
+                let band = Rect::from_two_pos(*start, pos);
+                for (i, t) in self.tiles.iter_mut().enumerate() {
+                    t.selected = base.get(i).copied().unwrap_or(false)
+                        || rects.get(i).is_some_and(|r| r.intersects(band));
+                }
+                let fg = preview::drag_painter(ui.ctx());
+                fg.rect(
+                    band.intersect(clip),
+                    2.0,
+                    p.accent.gamma_multiply(0.12),
+                    Stroke::new(1.0, p.accent),
+                    StrokeKind::Inside,
+                );
+                ui.ctx().request_repaint();
+            }
+            if !ui.input(|i| i.pointer.any_down()) {
+                self.marquee = None;
+            }
+        } else if background.clicked() && !modifiers.command && !modifiers.shift {
+            // Click on empty space clears the selection.
+            self.tiles.iter_mut().for_each(|t| t.selected = false);
+        }
+
+        // --- Keyboard shortcuts (not while typing in a text field) ---------------------
+        if self.drag.is_none() && !ui.ctx().egui_wants_keyboard_input() {
+            use egui::{Key, Modifiers};
+            let (all, clear, delete, dup, rot_r, rot_l, left, right) = ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::COMMAND, Key::A),
+                    nsel > 0 && i.consume_key(Modifiers::NONE, Key::Escape),
+                    i.key_pressed(Key::Delete),
+                    i.consume_key(Modifiers::COMMAND, Key::D),
+                    i.consume_key(Modifiers::COMMAND, Key::R),
+                    i.consume_key(Modifiers::COMMAND, Key::L),
+                    i.consume_key(Modifiers::COMMAND, Key::ArrowLeft),
+                    i.consume_key(Modifiers::COMMAND, Key::ArrowRight),
+                )
+            });
+            if all {
+                self.tiles.iter_mut().for_each(|t| t.selected = true);
+            }
+            if clear {
+                self.tiles.iter_mut().for_each(|t| t.selected = false);
+            }
+            if nsel > 0 {
+                if delete {
+                    self.tiles.retain(|t| !t.selected);
+                }
+                if dup {
+                    self.duplicate_selected();
+                }
+                if rot_r {
+                    self.rotate_selected(90);
+                }
+                if rot_l {
+                    self.rotate_selected(-90);
+                }
+                if left {
+                    self.move_selected(-1);
+                }
+                if right {
+                    self.move_selected(1);
+                }
+            }
         }
 
         if let Some(i) = view {
@@ -1347,8 +1460,8 @@ impl CompressState {
 pub struct ImagesState {
     images: Vec<PathBuf>,
     opts: ImageOptions,
-    /// Index of the image being dragged in the preview grid.
-    drag: Option<usize>,
+    /// Selection / drag state of the preview grid.
+    sel: preview::GridSel,
 }
 
 const MAX_SIZES: [(u32, &str); 6] = [
@@ -1373,6 +1486,7 @@ impl ImagesState {
             }
             if command(ui, self.images.len() > 1, I_SORT, "Sort by name") {
                 self.images.sort_by_key(|p| file_name(p).to_lowercase());
+                self.sel = Default::default();
             }
             if command(ui, !self.images.is_empty(), I_CLEAR, "Clear") {
                 self.images.clear();
@@ -1511,7 +1625,7 @@ impl ImagesState {
         }
         if !self.images.is_empty() {
             section(ui, &format!("Order of pages ({})", self.images.len()));
-            preview::sortable_grid(ui, thumbs, &mut self.drag, &mut self.images, "image", |p| {
+            preview::sortable_grid(ui, thumbs, &mut self.sel, &mut self.images, "image", |p| {
                 (
                     ViewItem {
                         path: p.clone(),

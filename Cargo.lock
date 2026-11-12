@@ -2473,6 +2473,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
+
+[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5041,13 +5047,14 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "util_bee"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "eframe",
  "flate2",
  "hayro",
  "image",
+ "jpeg-encoder",
  "lopdf",
  "rayon",
  "rfd",

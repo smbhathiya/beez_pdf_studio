@@ -352,20 +352,166 @@ pub struct TileStyle {
     pub highlight: bool,
 }
 
+/// Page selection for [`page_grid`]: one flag per page plus rubber-band state.
+#[derive(Default)]
+pub struct PageSel {
+    pub selected: Vec<bool>,
+    marquee: Option<(egui::Pos2, Vec<bool>)>,
+}
+
+impl PageSel {
+    /// Selected page numbers (1-based), in order.
+    pub fn pages(&self) -> Vec<u32> {
+        self.selected
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| i as u32 + 1)
+            .collect()
+    }
+
+    /// Select exactly these pages (1-based).
+    pub fn set_pages(&mut self, pages: &std::collections::HashSet<u32>) {
+        for (i, s) in self.selected.iter_mut().enumerate() {
+            *s = pages.contains(&(i as u32 + 1));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &mut self,
+        ui: &egui::Ui,
+        clicked: Option<usize>,
+        background: &egui::Response,
+        rects: &[Rect],
+        modifiers: egui::Modifiers,
+        pointer: Option<egui::Pos2>,
+        clip: Rect,
+    ) {
+        let p = Palette::current(ui);
+        let count = self.selected.iter().filter(|s| **s).count();
+        if let Some(i) = clicked {
+            if modifiers.shift {
+                let anchor = self.selected.iter().position(|s| *s).unwrap_or(i);
+                let (a, b) = (anchor.min(i), anchor.max(i));
+                self.selected
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(j, s)| *s = (a..=b).contains(&j));
+            } else if modifiers.command {
+                self.selected[i] ^= true;
+            } else {
+                let only = self.selected[i] && count == 1;
+                self.selected.iter_mut().for_each(|s| *s = false);
+                self.selected[i] = !only;
+            }
+        }
+        if background.drag_started()
+            && let Some(start) = background.interact_pointer_pos()
+        {
+            let base = if modifiers.command || modifiers.shift {
+                self.selected.clone()
+            } else {
+                vec![false; self.selected.len()]
+            };
+            self.marquee = Some((start, base));
+        }
+        if let Some((start, base)) = &self.marquee {
+            if let Some(pos) = pointer {
+                let band = Rect::from_two_pos(*start, pos);
+                for (i, s) in self.selected.iter_mut().enumerate() {
+                    *s = base.get(i).copied().unwrap_or(false)
+                        || rects.get(i).is_some_and(|r| r.intersects(band));
+                }
+                drag_painter(ui.ctx()).rect(
+                    band.intersect(clip),
+                    2.0,
+                    p.accent.gamma_multiply(0.12),
+                    Stroke::new(1.0, p.accent),
+                    StrokeKind::Inside,
+                );
+                drag_autoscroll(ui, clip, pos, false);
+                ui.ctx().request_repaint();
+            }
+            if !ui.input(|i| i.pointer.any_down()) {
+                self.marquee = None;
+            }
+        } else if background.clicked() && !modifiers.command && !modifiers.shift {
+            self.selected.iter_mut().for_each(|s| *s = false);
+        }
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let (all, clear) = ui.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
+                    count > 0 && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            });
+            if all {
+                self.selected.iter_mut().for_each(|s| *s = true);
+            }
+            if clear {
+                self.selected.iter_mut().for_each(|s| *s = false);
+            }
+        }
+    }
+}
+
+/// Compact page-range text for a sorted page list, e.g. `[1,2,3,5,8,9]` → `"1-3, 5, 8-9"`.
+pub fn ranges_text(pages: &[u32]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < pages.len() {
+        let start = pages[i];
+        let mut end = start;
+        while i + 1 < pages.len() && pages[i + 1] == end + 1 {
+            i += 1;
+            end = pages[i];
+        }
+        parts.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+        i += 1;
+    }
+    parts.join(", ")
+}
+
 /// A wrapping grid of every page of `path`. `style` customises each tile, `overlay` can draw
 /// on top of a page (it receives the page number and the on-screen rect of the page).
 /// Clicking a page opens the viewer.
+///
+/// With `selection` (one flag per page), clicking selects pages instead: Ctrl+click,
+/// Shift+click, dragging on empty space (rubber band), Ctrl+A and Esc work like in
+/// Windows Explorer, and double-click opens the viewer.
 pub fn page_grid(
     ui: &mut egui::Ui,
     thumbs: &mut Thumbs,
     path: &Path,
     pages: u32,
+    mut selection: Option<&mut PageSel>,
     style: impl Fn(u32) -> TileStyle,
     overlay: impl Fn(&egui::Painter, u32, Rect),
 ) {
     let p = Palette::current(ui);
+    if let Some(sel) = selection.as_deref_mut() {
+        sel.selected.resize(pages as usize, false);
+    }
+    let selecting = selection.is_some();
+    let modifiers = ui.input(|i| i.modifiers);
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let clip = ui.clip_rect();
+    let mut rects = Vec::with_capacity(pages as usize);
+    let mut clicked = None;
     ui.horizontal(|ui| {
-        caption(ui, "Click a page to view it full size.");
+        caption(
+            ui,
+            if selecting {
+                "Click to select · Ctrl / Shift for several · drag on empty space to select · Ctrl+A all · Esc clear · double-click to view"
+            } else {
+                "Click a page to view it full size."
+            },
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Slider::new(&mut thumbs.zoom, 0.6..=2.2).show_value(false));
             caption(ui, "Thumbnail size");
@@ -375,7 +521,7 @@ pub fn page_grid(
 
     let tile = Vec2::new(132.0, 176.0) * thumbs.zoom;
     let mut open = None;
-    egui::Frame::new()
+    let background = egui::Frame::new()
         .fill(if p.dark {
             Color32::from_rgb(0x1C, 0x1C, 0x1C)
         } else {
@@ -385,12 +531,33 @@ pub fn page_grid(
         .inner_margin(14.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // Background for rubber-band selection; created before the tiles so tiles win.
+            let background = selecting.then(|| {
+                ui.interact(
+                    ui.max_rect(),
+                    ui.make_persistent_id(("page_grid_bg", path)),
+                    Sense::click_and_drag(),
+                )
+            });
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
                 for page in 1..=pages {
                     let s = style(page);
                     let (rect, resp) = ui.allocate_exact_size(tile, Sense::click());
-                    if resp.hovered() {
+                    rects.push(rect);
+                    let is_selected = selection
+                        .as_deref()
+                        .is_some_and(|sel| sel.selected[(page - 1) as usize]);
+                    if is_selected {
+                        ui.painter()
+                            .rect_filled(rect, 6.0, p.accent.gamma_multiply(0.18));
+                        ui.painter().rect_stroke(
+                            rect,
+                            6.0,
+                            Stroke::new(2.0, p.accent),
+                            StrokeKind::Inside,
+                        );
+                    } else if resp.hovered() {
                         ui.painter().rect_filled(rect, 6.0, p.card_hover);
                     }
                     let area = Rect::from_min_max(
@@ -436,15 +603,22 @@ pub fn page_grid(
                             p.text2
                         },
                     );
-                    if resp
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if !selecting && resp.clicked() || selecting && resp.double_clicked() {
                         open = Some(page);
+                    } else if selecting && resp.clicked() {
+                        clicked = Some((page - 1) as usize);
                     }
                 }
             });
-        });
+            background
+        })
+        .inner;
+
+    if let (Some(sel), Some(background)) = (selection, background) {
+        sel.update(ui, clicked, &background, &rects, modifiers, pointer, clip);
+    }
+
     if let Some(page) = open {
         let items = (1..=pages)
             .map(|n| ViewItem {
@@ -621,22 +795,65 @@ pub fn move_item<T>(items: &mut Vec<T>, from: usize, at: usize) {
     items.insert(at, item);
 }
 
-/// A grid of thumbnails (one per item) that can be dragged to reorder, dragged onto the
-/// delete zone (or removed with the × button) and clicked to open the viewer.
+/// Move the elements at `set` (sorted indices) so they land before index `at`
+/// (index in the original order), keeping their relative order.
+pub fn move_items<T>(items: &mut Vec<T>, set: &[usize], at: usize) {
+    let mut moving = Vec::with_capacity(set.len());
+    let mut rest = Vec::with_capacity(items.len());
+    for (i, it) in items.drain(..).enumerate() {
+        if set.contains(&i) {
+            moving.push(it)
+        } else {
+            rest.push(it)
+        }
+    }
+    let before = set.iter().filter(|&&i| i < at).count();
+    let at = (at - before).min(rest.len());
+    rest.splice(at..at, moving);
+    *items = rest;
+}
+
+/// Selection, drag and rubber-band state of a [`sortable_grid`].
+#[derive(Default)]
+pub struct GridSel {
+    pub selected: Vec<bool>,
+    drag: Option<Vec<usize>>,
+    marquee: Option<(egui::Pos2, Vec<bool>)>,
+}
+
+impl GridSel {
+    pub fn count(&self) -> usize {
+        self.selected.iter().filter(|s| **s).count()
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.iter_mut().for_each(|s| *s = false);
+    }
+}
+
+/// A grid of thumbnails (one per item) with Windows-style selection:
+/// click, Ctrl+click, Shift+click, drag on empty space (rubber band), Ctrl+A, Esc,
+/// Delete. Selected items can be dragged together to reorder them or onto the delete zone.
+/// Double-click opens the viewer; the × button removes one item.
 /// `describe` returns the item's preview source, a title and a subtitle.
 pub fn sortable_grid<T>(
     ui: &mut egui::Ui,
     thumbs: &mut Thumbs,
-    drag: &mut Option<usize>,
+    sel: &mut GridSel,
     items: &mut Vec<T>,
     what: &str,
     describe: impl Fn(&T) -> (ViewItem, String, String),
 ) {
     let p = Palette::current(ui);
+    sel.selected.resize(items.len(), false);
+    let nsel = sel.count();
     ui.horizontal(|ui| {
         caption(
             ui,
-            "Drag to reorder · drop on the red zone or use × to remove · click to view.",
+            &format!(
+                "{} selected · drag to reorder · drag on empty space to select · Ctrl+A all · Del remove · double-click to view",
+                nsel
+            ),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Slider::new(&mut thumbs.zoom, 0.6..=2.2).show_value(false));
@@ -647,115 +864,200 @@ pub fn sortable_grid<T>(
 
     let tile = Vec2::new(150.0, 196.0) * thumbs.zoom;
     let pointer = ui.input(|i| i.pointer.interact_pos());
+    let modifiers = ui.input(|i| i.modifiers);
     let clip = ui.clip_rect();
     let mut rects = Vec::with_capacity(items.len());
-    let (mut started, mut open, mut remove) = (None, None, None);
+    let (mut started, mut clicked, mut open, mut remove) = (None, None, None, None);
+    let dragging: Vec<usize> = sel.drag.clone().unwrap_or_default();
 
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(if p.dark {
             Color32::from_rgb(0x1C, 0x1C, 0x1C)
         } else {
             Color32::from_rgb(0xEB, 0xEB, 0xEB)
         })
         .corner_radius(8.0)
-        .inner_margin(14.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
-                for (i, it) in items.iter().enumerate() {
-                    let (view, title, sub) = describe(it);
-                    let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
-                    rects.push(rect);
-                    let hovered = resp.hovered() && drag.is_none();
-                    if hovered {
-                        ui.painter().rect_filled(rect, 8.0, p.card_hover);
-                    }
-                    let area = Rect::from_min_max(
-                        rect.min + Vec2::splat(10.0),
-                        rect.max - Vec2::new(10.0, 46.0),
+        .inner_margin(14.0);
+    let frame_resp = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // Background for rubber-band selection; created before the tiles so tiles win.
+        let background = ui.interact(
+            ui.max_rect(),
+            ui.make_persistent_id(("grid_bg", what)),
+            Sense::click_and_drag(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
+            for (i, it) in items.iter().enumerate() {
+                let (view, title, sub) = describe(it);
+                let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                rects.push(rect);
+                let selected = sel.selected[i];
+                let hovered = resp.hovered() && dragging.is_empty();
+                if selected {
+                    ui.painter()
+                        .rect_filled(rect, 8.0, p.accent.gamma_multiply(0.18));
+                    ui.painter().rect_stroke(
+                        rect,
+                        8.0,
+                        Stroke::new(2.0, p.accent),
+                        StrokeKind::Inside,
                     );
-                    thumbs.paint_page(ui, &view.path, view.page, THUMB, view.rotate, area);
-                    let painter = ui.painter().with_clip_rect(rect);
-                    // Position badge.
-                    let badge =
-                        Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(26.0, 20.0));
-                    painter.rect_filled(badge, 4.0, p.accent);
-                    painter.text(
-                        badge.center(),
-                        Align2::CENTER_CENTER,
-                        (i + 1).to_string(),
-                        FontId::new(11.0, semibold()),
-                        p.on_accent,
-                    );
-                    painter.text(
-                        egui::pos2(rect.left() + 10.0, rect.bottom() - 38.0),
-                        Align2::LEFT_TOP,
-                        title,
-                        FontId::proportional(12.0),
-                        p.text,
-                    );
-                    painter.text(
-                        egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0),
-                        Align2::LEFT_TOP,
-                        sub,
-                        FontId::proportional(11.0),
-                        p.text2,
-                    );
-                    if *drag == Some(i) {
-                        ui.painter()
-                            .rect_filled(rect, 8.0, p.bg.gamma_multiply(0.75));
-                    }
-                    // × remove button (on hover).
-                    let x_rect = Rect::from_min_size(
-                        rect.right_top() + Vec2::new(-30.0, 6.0),
-                        Vec2::splat(24.0),
-                    );
-                    let x_resp =
-                        ui.interact(x_rect, ui.make_persistent_id(("remove", i)), Sense::click());
-                    if hovered || x_resp.hovered() {
-                        let fill = if x_resp.hovered() { p.error } else { p.card };
-                        ui.painter().circle(
-                            x_rect.center(),
-                            12.0,
-                            fill,
-                            Stroke::new(1.0, p.border),
-                        );
-                        ui.painter().text(
-                            x_rect.center(),
-                            Align2::CENTER_CENTER,
-                            I_CLOSE,
-                            FontId::proportional(10.0),
-                            if x_resp.hovered() {
-                                Color32::WHITE
-                            } else {
-                                p.text
-                            },
-                        );
-                    }
-                    if x_resp.on_hover_text("Remove").clicked() {
-                        remove = Some(i);
-                    } else if resp.drag_started() {
-                        started = Some(i);
-                    } else if resp.clicked() {
-                        open = Some(i);
-                    }
+                } else if hovered {
+                    ui.painter().rect_filled(rect, 8.0, p.card_hover);
                 }
-            });
+                let area = Rect::from_min_max(
+                    rect.min + Vec2::splat(10.0),
+                    rect.max - Vec2::new(10.0, 46.0),
+                );
+                thumbs.paint_page(ui, &view.path, view.page, THUMB, view.rotate, area);
+                let painter = ui.painter().with_clip_rect(rect);
+                let badge = Rect::from_min_size(rect.min + Vec2::splat(6.0), Vec2::new(26.0, 20.0));
+                painter.rect_filled(badge, 4.0, p.accent);
+                painter.text(
+                    badge.center(),
+                    Align2::CENTER_CENTER,
+                    (i + 1).to_string(),
+                    FontId::new(11.0, semibold()),
+                    p.on_accent,
+                );
+                painter.text(
+                    egui::pos2(rect.left() + 10.0, rect.bottom() - 38.0),
+                    Align2::LEFT_TOP,
+                    title,
+                    FontId::proportional(12.0),
+                    p.text,
+                );
+                painter.text(
+                    egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0),
+                    Align2::LEFT_TOP,
+                    sub,
+                    FontId::proportional(11.0),
+                    p.text2,
+                );
+                if dragging.contains(&i) {
+                    ui.painter()
+                        .rect_filled(rect, 8.0, p.bg.gamma_multiply(0.75));
+                }
+                // × remove button (on hover).
+                let x_rect = Rect::from_min_size(
+                    rect.right_top() + Vec2::new(-30.0, 6.0),
+                    Vec2::splat(24.0),
+                );
+                let x_resp = ui.interact(
+                    x_rect,
+                    ui.make_persistent_id(("remove", what, i)),
+                    Sense::click(),
+                );
+                if hovered || x_resp.hovered() {
+                    let fill = if x_resp.hovered() { p.error } else { p.card };
+                    ui.painter()
+                        .circle(x_rect.center(), 12.0, fill, Stroke::new(1.0, p.border));
+                    ui.painter().text(
+                        x_rect.center(),
+                        Align2::CENTER_CENTER,
+                        I_CLOSE,
+                        FontId::proportional(10.0),
+                        if x_resp.hovered() {
+                            Color32::WHITE
+                        } else {
+                            p.text
+                        },
+                    );
+                }
+                if x_resp.on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                } else if resp.drag_started() {
+                    started = Some(i);
+                } else if resp.double_clicked() {
+                    open = Some(i);
+                } else if resp.clicked() {
+                    clicked = Some(i);
+                }
+            }
         });
+        background
+    });
+    let background = frame_resp.inner;
 
-    if let Some(i) = started {
-        *drag = Some(i);
+    // --- Click selection ---------------------------------------------------------------
+    if let Some(i) = clicked {
+        if modifiers.shift {
+            let anchor = sel.selected.iter().position(|s| *s).unwrap_or(i);
+            let (a, b) = (anchor.min(i), anchor.max(i));
+            sel.selected
+                .iter_mut()
+                .enumerate()
+                .for_each(|(j, s)| *s = (a..=b).contains(&j));
+        } else if modifiers.command {
+            sel.selected[i] ^= true;
+        } else {
+            let only = sel.selected[i] && nsel == 1;
+            sel.clear();
+            sel.selected[i] = !only;
+        }
     }
-    if let (Some(from), Some(pos)) = (*drag, pointer) {
+
+    // --- Rubber-band selection -----------------------------------------------------------
+    if background.drag_started()
+        && sel.drag.is_none()
+        && let Some(start) = background.interact_pointer_pos()
+    {
+        let base = if modifiers.command || modifiers.shift {
+            sel.selected.clone()
+        } else {
+            vec![false; items.len()]
+        };
+        sel.marquee = Some((start, base));
+    }
+    if let Some((start, base)) = &sel.marquee {
+        if let Some(pos) = pointer {
+            let band = Rect::from_two_pos(*start, pos);
+            for (i, s) in sel.selected.iter_mut().enumerate() {
+                *s = base.get(i).copied().unwrap_or(false)
+                    || rects.get(i).is_some_and(|r| r.intersects(band));
+            }
+            drag_painter(ui.ctx()).rect(
+                band.intersect(clip),
+                2.0,
+                p.accent.gamma_multiply(0.12),
+                Stroke::new(1.0, p.accent),
+                StrokeKind::Inside,
+            );
+            ui.ctx().request_repaint();
+        }
+        if !ui.input(|i| i.pointer.any_down()) {
+            sel.marquee = None;
+        }
+    } else if background.clicked() && !modifiers.command && !modifiers.shift {
+        sel.clear();
+    }
+
+    // --- Drag to reorder / delete (the whole selection moves together) -----------------
+    if let Some(i) = started {
+        let set: Vec<usize> = if sel.selected[i] {
+            (0..items.len()).filter(|&j| sel.selected[j]).collect()
+        } else {
+            sel.clear();
+            sel.selected[i] = true;
+            vec![i]
+        };
+        sel.drag = Some(set);
+    }
+    if let (Some(set), Some(pos)) = (sel.drag.clone(), pointer) {
         let ctx = ui.ctx().clone();
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        let over_trash = trash_zone(&ctx, clip, pos, what);
+        let label = if set.len() == 1 {
+            what.to_string()
+        } else {
+            format!("{} {what}s", set.len())
+        };
+        let over_trash = trash_zone(&ctx, clip, pos, &label);
         let insert = (!over_trash).then(|| grid_insert_index(&rects, pos));
         if let Some(at) = insert {
             grid_insert_marker(&ctx, &rects, at);
         }
-        if let Some(it) = items.get(from) {
+        if let Some(it) = items.get(set[0]) {
             let (view, _, _) = describe(it);
             egui::Area::new(egui::Id::unique("sortable_ghost"))
                 .order(egui::Order::Tooltip)
@@ -779,35 +1081,97 @@ pub fn sortable_grid<T>(
                         view.rotate,
                         r.shrink(10.0),
                     );
+                    if set.len() > 1 {
+                        let c = r.right_top() + Vec2::new(-6.0, 6.0);
+                        ui.painter().circle_filled(c, 12.0, p.accent);
+                        ui.painter().text(
+                            c,
+                            Align2::CENTER_CENTER,
+                            set.len().to_string(),
+                            FontId::new(12.0, semibold()),
+                            p.on_accent,
+                        );
+                    }
                 });
         }
         drag_autoscroll(ui, clip, pos, over_trash);
         if ui.input(|i| i.pointer.any_released()) {
             if over_trash {
-                if from < items.len() {
-                    items.remove(from);
-                }
+                remove_items(items, &mut sel.selected, &set);
             } else if let Some(at) = insert {
-                move_item(items, from, at);
+                move_items(items, &set, at);
+                move_items(&mut sel.selected, &set, at);
             }
-            *drag = None;
+            sel.drag = None;
         }
         ctx.request_repaint();
-    } else if drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
-        *drag = None;
+    } else if sel.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+        sel.drag = None;
+    }
+
+    // --- Keyboard shortcuts ----------------------------------------------------------------
+    if sel.drag.is_none() && !ui.ctx().egui_wants_keyboard_input() {
+        let (all, clear, delete) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
+                nsel > 0 && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                nsel > 0 && i.key_pressed(egui::Key::Delete),
+            )
+        });
+        if all {
+            sel.selected.iter_mut().for_each(|s| *s = true);
+        }
+        if clear {
+            sel.clear();
+        }
+        if delete {
+            let set: Vec<usize> = (0..items.len()).filter(|&j| sel.selected[j]).collect();
+            remove_items(items, &mut sel.selected, &set);
+        }
     }
 
     if let Some(i) = remove {
-        items.remove(i);
+        remove_items(items, &mut sel.selected, &[i]);
     } else if let Some(i) = open {
         let views = items.iter().map(|it| describe(it).0).collect();
         thumbs.open_viewer(views, i);
     }
 }
 
+/// Remove the items at `set` (sorted indices) together with their selection flags.
+fn remove_items<T>(items: &mut Vec<T>, selected: &mut Vec<bool>, set: &[usize]) {
+    let mut k = 0;
+    items.retain(|_| {
+        k += 1;
+        !set.contains(&(k - 1))
+    });
+    let mut k = 0;
+    selected.retain(|_| {
+        k += 1;
+        !set.contains(&(k - 1))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::move_item;
+
+    #[test]
+    fn ranges_text_compacts() {
+        assert_eq!(super::ranges_text(&[1, 2, 3, 5, 8, 9]), "1-3, 5, 8-9");
+        assert_eq!(super::ranges_text(&[]), "");
+        assert_eq!(super::ranges_text(&[4]), "4");
+    }
+
+    #[test]
+    fn move_items_groups() {
+        let mut v = vec![1, 2, 3, 4, 5];
+        super::move_items(&mut v, &[1, 3], 5);
+        assert_eq!(v, [1, 3, 5, 2, 4]);
+        let mut v = vec![1, 2, 3, 4, 5];
+        super::move_items(&mut v, &[3, 4], 0);
+        assert_eq!(v, [4, 5, 1, 2, 3]);
+    }
 
     #[test]
     fn move_item_positions() {

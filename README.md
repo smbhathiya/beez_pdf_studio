@@ -39,6 +39,21 @@ There are also two optional settings:
 
 Images are processed in parallel. Example: three screenshot PNGs totalling 246 KB were embedded in 211 KB, pixel for pixel identical.
 
+### Selecting pages and images
+
+Page grids work like Windows Explorer:
+
+| Action | How |
+|---|---|
+| Select | Click · **Ctrl+click** to add · **Shift+click** for a range · **drag on empty space** for a rubber band |
+| Select all / none | **Ctrl+A** / **Esc** (or click empty space) |
+| Reorder | Drag the selection to a new place (Page Organizer, Images to PDF) |
+| Remove | **Delete**, or drag onto the red zone |
+| Page Organizer only | **Ctrl+D** duplicate · **Ctrl+R** / **Ctrl+L** rotate · **Ctrl+← / →** move |
+| View large | Double-click |
+
+In **Split & Extract** (ranges / extract modes), selecting pages fills in the page-range box, and typing a range selects those pages.
+
 ### Page previews
 
 Every PDF tool shows real thumbnails of all pages, rendered in the app with [hayro](https://github.com/LaurenzV/hayro) (pure Rust, so no extra DLLs are needed):
