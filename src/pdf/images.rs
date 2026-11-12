@@ -20,10 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression as Level, write::ZlibEncoder};
-use image::{
-    DynamicImage, ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder,
-    metadata::Orientation as Exif,
-};
+use image::{DynamicImage, ImageDecoder, ImageReader, metadata::Orientation as Exif};
 use lopdf::{Dictionary, Document, Object, Stream, dictionary};
 use rayon::prelude::*;
 
@@ -194,15 +191,32 @@ fn jpeg_passthrough(data: Vec<u8>, w: u32, h: u32, comps: u8) -> Option<Encoded>
     })
 }
 
-fn jpeg_encode(pixels: &[u8], w: u32, h: u32, gray: bool, quality: u8) -> Result<Vec<u8>> {
+/// High-efficiency JPEG encoding (shared with the Compress tool):
+/// optimized Huffman tables, progressive scans and, below quality 90, 4:2:0 colour
+/// subsampling. Typically 15–30 % smaller than a baseline encoder at the same quality.
+pub(crate) fn jpeg_encode(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    gray: bool,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+    let (w16, h16) = (u16::try_from(w)?, u16::try_from(h)?);
+    let quality = quality.clamp(10, 100);
     let mut out = Vec::new();
+    let mut enc = Encoder::new(&mut out, quality);
+    enc.set_optimized_huffman_tables(true);
+    enc.set_progressive(true);
+    if !gray && quality < 90 {
+        enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+    }
     let color = if gray {
-        image::ExtendedColorType::L8
+        ColorType::Luma
     } else {
-        image::ExtendedColorType::Rgb8
+        ColorType::Rgb
     };
-    JpegEncoder::new_with_quality(Cursor::new(&mut out), quality.clamp(10, 100))
-        .encode(pixels, w, h, color)?;
+    enc.encode(pixels, w16, h16, color)?;
     Ok(out)
 }
 
@@ -272,7 +286,7 @@ fn png_predict(raw: &[u8], row_bytes: usize, bpp: usize, fixed: Option<u8>) -> V
     out
 }
 
-fn deflate(data: &[u8]) -> Vec<u8> {
+pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
     let mut enc = ZlibEncoder::new(Vec::with_capacity(data.len() / 2), Level::best());
     enc.write_all(data).expect("writing to memory cannot fail");
     enc.finish().expect("writing to memory cannot fail")
@@ -334,7 +348,12 @@ fn pack_indices(idx: &[u8], w: usize, bpc: u32) -> Vec<u8> {
 }
 
 /// Encode decoded pixels (`rgb` is 3 bytes/pixel) for the PDF.
-fn encode_pixels(rgb: &[u8], w: u32, h: u32, quality: Quality) -> Result<(Dictionary, Vec<u8>)> {
+pub(crate) fn encode_pixels(
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    quality: Quality,
+) -> Result<(Dictionary, Vec<u8>)> {
     let dict = image_dict(w, h);
     let gray = rgb
         .as_chunks::<3>()
