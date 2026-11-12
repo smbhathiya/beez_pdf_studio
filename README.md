@@ -299,6 +299,15 @@ util_bee/
 
 ---
 
+## Windows compatibility
+
+Runs on **Windows 10 and Windows 11 (64-bit)**.
+
+- **No runtime to install:** the Microsoft C runtime is linked into `util_bee.exe` ([`.cargo/config.toml`](.cargo/config.toml)), so it does not need `VCRUNTIME140.dll`.
+- **Graphics fallback:** the window is drawn with DirectX 12 / Vulkan when available. On older graphics cards, virtual machines or Remote Desktop, the app automatically restarts itself using **OpenGL**. If neither works, it shows an error message asking the user to update the graphics driver.
+- To force OpenGL (for troubleshooting), set the environment variable `UTILBEE_RENDERER=gl`.
+- On Windows 10 the icons come from *Segoe MDL2 Assets* instead of *Segoe Fluent Icons*. They look nearly identical.
+
 ## Known limitations
 
 - Password-protected PDFs show no preview until they are unlocked. Very unusual PDF features may render slightly differently from Adobe Reader, but the saved files are not affected, because previews are display-only.

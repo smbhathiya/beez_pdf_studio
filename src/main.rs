@@ -22,8 +22,9 @@ fn window_icon() -> egui::IconData {
     }
 }
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
+fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_title("Beez PDF Studio")
             .with_icon(window_icon())
@@ -31,10 +32,66 @@ fn main() -> eframe::Result {
             .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true),
         ..Default::default()
-    };
-    eframe::run_native(
-        "Beez PDF Studio",
-        options,
-        Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
-    )
+    }
+}
+
+/// Open the window with one graphics backend. Panics inside the backend count as failures.
+fn run(renderer: eframe::Renderer) -> Result<(), String> {
+    let result = std::panic::catch_unwind(|| {
+        eframe::run_native(
+            "Beez PDF Studio",
+            options(renderer),
+            Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
+        )
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the graphics driver stopped unexpectedly".into()),
+    }
+}
+
+/// Set when the app restarts itself with OpenGL (also lets users force OpenGL).
+const RENDERER_ENV: &str = "UTILBEE_RENDERER";
+/// Carries the DirectX/Vulkan error into the OpenGL restart, for the error dialog.
+const FIRST_ERROR_ENV: &str = "UTILBEE_FIRST_RENDERER_ERROR";
+
+fn show_startup_error(details: &str) {
+    rfd::MessageDialog::new()
+        .set_title("Beez PDF Studio")
+        .set_description(format!(
+            "Beez PDF Studio could not start because the graphics system is not available.\n\n\
+             Please update your graphics driver and try again.\n\nDetails:\n{details}"
+        ))
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+}
+
+fn main() {
+    // DirectX 12 / Vulkan first (fast, modern). Older graphics cards, virtual machines and
+    // Remote Desktop often lack them; then the app restarts itself using OpenGL. (Windows
+    // allows only one window event loop per process, so a restart is needed to switch.)
+    let use_gl = std::env::var(RENDERER_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("gl"));
+
+    if !use_gl {
+        let Err(wgpu_error) = run(eframe::Renderer::Wgpu) else { return };
+        let restarted = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env(RENDERER_ENV, "gl")
+                .env(FIRST_ERROR_ENV, &wgpu_error)
+                .spawn()
+        });
+        if let Err(e) = restarted {
+            show_startup_error(&format!("• DirectX/Vulkan: {wgpu_error}\n• Restart with OpenGL: {e}"));
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Err(gl_error) = run(eframe::Renderer::Glow) {
+        let first = std::env::var(FIRST_ERROR_ENV).unwrap_or_else(|_| "not tried".into());
+        show_startup_error(&format!("• DirectX/Vulkan: {first}\n• OpenGL: {gl_error}"));
+        std::process::exit(1);
+    }
 }

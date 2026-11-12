@@ -1,0 +1,7 @@
+# Link the Microsoft C runtime statically, so util_bee.exe does not need
+# VCRUNTIME140.dll (missing on many Windows 10 PCs) — the .exe runs on its own.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
