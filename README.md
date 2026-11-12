@@ -301,7 +301,10 @@ util_bee/
 
 ## Windows compatibility
 
-Runs on **Windows 10 and Windows 11 (64-bit)**.
+Runs on **Windows 10 and Windows 11**, 64-bit and 32-bit. The installer contains both builds and installs the right one; Windows 10 on ARM uses the 32-bit build.
+
+- **Start-up log:** `%LOCALAPPDATA%\Beez PDF Studio\startup.log` records the Windows version, which graphics mode was used, and any error or crash. Ask users to send this file when the app does not start.
+- **Crash-safe graphics choice:** if a graphics driver crashes the app while DirectX/Vulkan is being set up, the next start automatically uses OpenGL (remembered until the next app update).
 
 - **No runtime to install:** the Microsoft C runtime is linked into `util_bee.exe` ([`.cargo/config.toml`](.cargo/config.toml)), so it does not need `VCRUNTIME140.dll`.
 - **Graphics fallback:** the window is drawn with DirectX 12 / Vulkan when available. On older graphics cards, virtual machines or Remote Desktop, the app automatically restarts itself using **OpenGL**. If neither works, it shows an error message asking the user to update the graphics driver.

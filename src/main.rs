@@ -4,6 +4,7 @@
 use eframe::egui;
 
 mod pdf;
+mod startup;
 mod ui;
 mod updater;
 
@@ -36,19 +37,31 @@ fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
 }
 
 /// Open the window with one graphics backend. Panics inside the backend count as failures.
-fn run(renderer: eframe::Renderer) -> Result<(), String> {
+fn run(renderer: eframe::Renderer, name: &'static str) -> Result<(), String> {
+    startup::log(&format!("starting with {name}"));
     let result = std::panic::catch_unwind(|| {
         eframe::run_native(
             "Beez PDF Studio",
             options(renderer),
-            Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
+            Box::new(move |cc| {
+                // Reaching this point means the graphics backend works on this PC.
+                startup::log(&format!("{name} is working"));
+                if name == "DirectX/Vulkan" {
+                    startup::write_marker("wgpu-ok");
+                }
+                Ok(Box::new(ui::App::new(cc)))
+            }),
         )
     });
-    match result {
+    let result = match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("the graphics driver stopped unexpectedly".into()),
+    };
+    if let Err(e) = &result {
+        startup::log(&format!("{name} failed: {e}"));
     }
+    result
 }
 
 /// Set when the app restarts itself with OpenGL (also lets users force OpenGL).
@@ -61,20 +74,42 @@ fn show_startup_error(details: &str) {
         .set_title("Beez PDF Studio")
         .set_description(format!(
             "Beez PDF Studio could not start because the graphics system is not available.\n\n\
-             Please update your graphics driver and try again.\n\nDetails:\n{details}"
+             Please update your graphics driver and try again.\n\nDetails:\n{details}\n\n\
+             A log was saved to:\n{}",
+            startup::log_path().display()
         ))
         .set_level(rfd::MessageLevel::Error)
         .show();
 }
 
 fn main() {
+    startup::install_panic_hook();
+    startup::log(&format!(
+        "Beez PDF Studio {} ({}) on {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        startup::windows_version()
+    ));
+
     // DirectX 12 / Vulkan first (fast, modern). Older graphics cards, virtual machines and
     // Remote Desktop often lack them; then the app restarts itself using OpenGL. (Windows
     // allows only one window event loop per process, so a restart is needed to switch.)
-    let use_gl = std::env::var(RENDERER_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("gl"));
+    let marker = startup::read_marker();
+    let forced = std::env::var(RENDERER_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("gl"));
+    let use_gl = forced || marker == "gl" || marker == "wgpu-starting";
+    if marker == "wgpu-starting" {
+        // The previous start was killed while setting up DirectX/Vulkan (a driver crash).
+        startup::log("previous start crashed during DirectX/Vulkan setup; using OpenGL");
+        startup::write_marker("gl");
+    }
 
     if !use_gl {
-        let Err(wgpu_error) = run(eframe::Renderer::Wgpu) else { return };
+        startup::write_marker("wgpu-starting");
+        let Err(wgpu_error) = run(eframe::Renderer::Wgpu, "DirectX/Vulkan") else {
+            return;
+        };
+        // Remember for next time, and restart with OpenGL now.
+        startup::write_marker("gl");
         let restarted = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
                 .args(std::env::args_os().skip(1))
@@ -83,13 +118,18 @@ fn main() {
                 .spawn()
         });
         if let Err(e) = restarted {
-            show_startup_error(&format!("• DirectX/Vulkan: {wgpu_error}\n• Restart with OpenGL: {e}"));
+            startup::log(&format!("restart with OpenGL failed: {e}"));
+            show_startup_error(&format!(
+                "• DirectX/Vulkan: {wgpu_error}\n• Restart with OpenGL: {e}"
+            ));
             std::process::exit(1);
         }
         return;
     }
 
-    if let Err(gl_error) = run(eframe::Renderer::Glow) {
+    if let Err(gl_error) = run(eframe::Renderer::Glow, "OpenGL") {
+        // Next time, try DirectX/Vulkan again (e.g. after a driver update).
+        startup::write_marker("");
         let first = std::env::var(FIRST_ERROR_ENV).unwrap_or_else(|_| "not tried".into());
         show_startup_error(&format!("• DirectX/Vulkan: {first}\n• OpenGL: {gl_error}"));
         std::process::exit(1);
