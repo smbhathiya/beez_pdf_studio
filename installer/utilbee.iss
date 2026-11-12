@@ -33,7 +33,9 @@ DisableProgramGroupPage=yes
 DisableDirPage=auto
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-ArchitecturesAllowed=x64compatible
+; Runs on 64-bit and 32-bit Windows (and Windows 10 on ARM through x86 emulation);
+; the matching build of the app is installed.
+ArchitecturesAllowed=x86compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=Beez-PDF-Studio-Setup-v{#AppVersion}
@@ -54,7 +56,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "openwith"; Description: "Show {#AppName} in the ""Open with"" menu for PDF files"; GroupDescription: "Integration:"
 
 [Files]
-Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; 64-bit build (cargo build --release) and 32-bit build
+; (cargo build --release --target i686-pc-windows-msvc).
+Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion; Check: Is64BitInstallMode
+Source: "..\target\i686-pc-windows-msvc\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion; Check: not Is64BitInstallMode
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
